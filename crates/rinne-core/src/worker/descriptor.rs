@@ -128,6 +128,11 @@ pub struct WorkerDescriptor {
     pub quota: QuotaModel,
     pub latency: LatencyProfile,
     pub transport: Transport,
+    /// Models this worker can run (e.g. `["opus", "sonnet", "haiku"]`). Empty
+    /// means the worker has a single fixed model. The conductor picks from this
+    /// list per node to optimize cost/latency (`CONTEXT.md` §7).
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 impl WorkerDescriptor {
