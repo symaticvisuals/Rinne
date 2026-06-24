@@ -10,3 +10,6 @@
 github.txt
 
 Cargo.lock
+
+.env.Local
+.gstack/
