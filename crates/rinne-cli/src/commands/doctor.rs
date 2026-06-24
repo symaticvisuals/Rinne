@@ -37,6 +37,13 @@ fn print_report(config: &Config, report: &DoctorReport) {
         }
     }
 
+    if !report.recommendations.is_empty() {
+        println!("\n💡 RECOMMENDATIONS");
+        for r in &report.recommendations {
+            println!("  • {r}");
+        }
+    }
+
     let available = report.available().count();
     println!(
         "\n{available} worker(s) available. {} metered.",
