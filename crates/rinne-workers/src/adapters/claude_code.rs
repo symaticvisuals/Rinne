@@ -50,65 +50,172 @@ fn descriptor() -> WorkerDescriptor {
         },
         latency: LatencyProfile::Medium,
         transport: Transport::SubprocessJson,
+        // Claude `--model` aliases, listed cheap→strong (the cascade ladder).
+        models: vec!["haiku".into(), "sonnet".into(), "opus".into()],
     }
 }
 
-fn build_args(prompt: &str) -> Vec<String> {
-    vec![
+fn build_args(prompt: &str, model: Option<&str>) -> Vec<String> {
+    // `stream-json` emits one NDJSON event per line as work happens, so the user
+    // sees reads/edits/commands live instead of one blob at the end. `--verbose`
+    // is required to stream events under `-p`.
+    let mut args = vec![
         "-p".into(),
         prompt.into(),
         "--output-format".into(),
-        "json".into(),
-    ]
+        "stream-json".into(),
+        "--verbose".into(),
+    ];
+    if let Some(m) = model {
+        args.push("--model".into());
+        args.push(m.into());
+    }
+    args
 }
 
-/// Parse Claude Code's `--output-format json` result, defensively.
+/// Parse Claude Code's stream-json output: find the terminal `result` event
+/// (a line with `"type":"result"` or a `result` field) and extract its fields.
 fn parse(out: &SubprocessOutput) -> ParsedHarness {
-    let Some(value) = last_json_object(&out.stdout) else {
-        return ParsedHarness::raw(&out.stdout);
+    for line in out.stdout.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let is_result = value.get("type").and_then(|t| t.as_str()) == Some("result")
+            || value.get("result").is_some();
+        if !is_result {
+            continue;
+        }
+
+        let result = value
+            .get("result")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let session_id = value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let is_error = value.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+        let usage = value
+            .get("usage")
+            .map(|u| Usage {
+                prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                wall_ms: 0,
+            })
+            .unwrap_or_default();
+        return ParsedHarness {
+            result,
+            session_id,
+            usage,
+            is_error,
+        };
+    }
+    ParsedHarness::raw(&out.stdout)
+}
+
+/// Map one NDJSON stream event into live worker events. An assistant message can
+/// carry several content blocks (text + tool uses), so this returns a vector.
+fn line_mapper(line: &str) -> Vec<WorkerEvent> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Vec::new();
     };
 
-    let result = value
-        .get("result")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| out.stdout.trim().to_string());
+    match value.get("type").and_then(|t| t.as_str()) {
+        // The init event names the model the harness is actually running.
+        Some("system") => {
+            if value.get("subtype").and_then(|s| s.as_str()) == Some("init") {
+                if let Some(model) = value.get("model").and_then(|m| m.as_str()) {
+                    return vec![WorkerEvent::Message(format!("model: {}", short_model(model)))];
+                }
+            }
+            return Vec::new();
+        }
+        // Assistant messages carry text + tool uses (handled below).
+        Some("assistant") => {}
+        // Suppress tool_result and the final result event (parsed separately).
+        _ => return Vec::new(),
+    }
 
-    let session_id = value
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let Some(content) = value.pointer("/message/content").and_then(|c| c.as_array()) else {
+        return Vec::new();
+    };
 
-    let is_error = value
-        .get("is_error")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let mut events = Vec::new();
+    for block in content {
+        match block.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        events.push(WorkerEvent::Message(text.to_string()));
+                    }
+                }
+            }
+            Some("tool_use") => {
+                let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                let input = block.get("input").cloned().unwrap_or(serde_json::Value::Null);
+                events.push(tool_event(name, &input));
+            }
+            _ => {}
+        }
+    }
+    events
+}
 
-    let usage = value
-        .get("usage")
-        .map(|u| Usage {
-            prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            wall_ms: 0,
-        })
-        .unwrap_or_default();
-
-    ParsedHarness {
-        result,
-        session_id,
-        usage,
-        is_error,
+/// Render a Claude tool call as a friendly, harness-style line.
+fn tool_event(name: &str, input: &serde_json::Value) -> WorkerEvent {
+    let s = |k: &str| input.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    match name {
+        "Read" => WorkerEvent::Reading(short_path(&s("file_path"))),
+        "Write" => WorkerEvent::Editing(format!("writing {}", short_path(&s("file_path")))),
+        "Edit" | "MultiEdit" | "NotebookEdit" => {
+            WorkerEvent::Editing(format!("editing {}", short_path(&s("file_path"))))
+        }
+        "Bash" => {
+            let desc = s("description");
+            let cmd = s("command");
+            WorkerEvent::ToolUse(if desc.is_empty() { truncate(&cmd, 80) } else { desc })
+        }
+        "Glob" => WorkerEvent::ToolUse(format!("glob {}", s("pattern"))),
+        "Grep" => WorkerEvent::ToolUse(format!("grep {}", s("pattern"))),
+        "Task" => WorkerEvent::ToolUse(format!("subagent: {}", s("description"))),
+        "TodoWrite" => WorkerEvent::Message("updating plan".into()),
+        "WebSearch" => WorkerEvent::ToolUse(format!("web search {}", s("query"))),
+        "WebFetch" => WorkerEvent::ToolUse(format!("fetch {}", s("url"))),
+        other => WorkerEvent::ToolUse(other.to_string()),
     }
 }
 
-/// Best-effort: surface progress lines as messages. Claude's `-p` json mode
-/// emits a single final object, so most lines are the result; keep it raw.
-fn line_mapper(line: &str) -> Option<WorkerEvent> {
-    let t = line.trim();
-    if t.is_empty() {
-        None
+/// Friendly model label: `claude-opus-4-8[1m]` → `opus-4-8`.
+fn short_model(m: &str) -> String {
+    m.split_once("[1m]")
+        .map(|(a, _)| a)
+        .unwrap_or(m)
+        .strip_prefix("claude-")
+        .unwrap_or(m)
+        .to_string()
+}
+
+/// Show the last two path segments so lines stay readable.
+fn short_path(p: &str) -> String {
+    let parts: Vec<&str> = p.rsplit('/').take(2).collect();
+    parts.into_iter().rev().collect::<Vec<_>>().join("/")
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
     } else {
-        Some(WorkerEvent::Raw(t.to_string()))
+        s.chars().take(max).collect::<String>() + "…"
     }
 }
 
