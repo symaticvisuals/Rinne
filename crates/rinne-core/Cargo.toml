@@ -13,3 +13,5 @@ tracing.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true
+futures-util = "0.3"
+rusqlite.workspace = true
