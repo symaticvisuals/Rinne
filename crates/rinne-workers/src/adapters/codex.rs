@@ -44,11 +44,18 @@ fn descriptor() -> WorkerDescriptor {
         },
         latency: LatencyProfile::Medium,
         transport: Transport::SubprocessJson,
+        models: Vec::new(),
     }
 }
 
-fn build_args(prompt: &str) -> Vec<String> {
-    vec!["exec".into(), prompt.into()]
+fn build_args(prompt: &str, model: Option<&str>) -> Vec<String> {
+    let mut args = vec!["exec".into()];
+    if let Some(m) = model {
+        args.push("--model".into());
+        args.push(m.into());
+    }
+    args.push(prompt.into());
+    args
 }
 
 /// `codex exec` is line/stream oriented rather than a single JSON object, so we
@@ -57,11 +64,11 @@ fn parse(out: &SubprocessOutput) -> ParsedHarness {
     ParsedHarness::raw(&out.stdout)
 }
 
-fn line_mapper(line: &str) -> Option<WorkerEvent> {
+fn line_mapper(line: &str) -> Vec<WorkerEvent> {
     let t = line.trim();
     if t.is_empty() {
-        None
+        Vec::new()
     } else {
-        Some(WorkerEvent::Raw(t.to_string()))
+        vec![WorkerEvent::Message(t.to_string())]
     }
 }
