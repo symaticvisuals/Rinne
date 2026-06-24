@@ -1,0 +1,13 @@
+{
+  "goal": "Confirm the Rinne loop drives a real worker end to end",
+  "nodes": [
+    {
+      "id": "n1",
+      "role": "generator",
+      "instruction": "Reply with a single short sentence confirming you ran as a Rinne worker. Do not edit, create, or delete any files.",
+      "needs": ["reasoning"],
+      "prefer": "harness:claude-code",
+      "outputs": ["hello.md"]
+    }
+  ]
+}
