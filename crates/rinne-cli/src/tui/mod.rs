@@ -1,0 +1,1056 @@
+//! The interactive REPL/TUI (`CONTEXT.md` §6; `PHASE.md` P6).
+//!
+//! Harness-style rendering: the transcript is written to the terminal's NORMAL
+//! scrollback (natively scrollable, never clipped to the window, and preserved
+//! when you quit), while a small inline viewport at the bottom holds the live
+//! status, any in-progress streamed text, the `@`-picker, and the prompt. This
+//! mirrors how Claude Code / Grok behave, rather than a fixed full-screen grid.
+
+mod index;
+mod complete;
+mod picker;
+mod ui;
+
+use std::collections::HashSet;
+use std::io::{self, IsTerminal};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{anyhow, Result};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use futures_util::StreamExt;
+use ratatui::backend::CrosstermBackend;
+use ratatui::{Terminal, TerminalOptions, Viewport};
+use tokio_util::sync::CancellationToken;
+
+use rinne_conductor::ConductorInput;
+use rinne_core::{
+    Blackboard, Engine, EngineEvent, HumanDecision, NodeStatus, ResumeInput, RunReport, StopReason,
+};
+
+use crate::runner;
+use complete::Completion;
+use index::FileIndex;
+use picker::Picker;
+
+/// Guardrail: refuse a glob that expands past this before the conductor sees it.
+const GLOB_LIMIT: usize = 400;
+
+/// A node as shown in the (printed) plan listing and progress count.
+#[derive(Clone)]
+pub struct NodeView {
+    pub id: String,
+    pub role: String,
+    pub status: NodeStatus,
+    pub worker: String,
+}
+
+/// The kind of transcript entry, which drives its glyph, indent, and color.
+#[derive(Clone, Copy, PartialEq)]
+pub enum FeedKind {
+    System,
+    Conductor,
+    NodeStart,
+    Stream,
+    NodeOk,
+    NodeFail,
+    Parked,
+}
+
+/// One transcript line, committed to scrollback.
+#[derive(Clone)]
+pub struct FeedEntry {
+    pub kind: FeedKind,
+    pub text: String,
+}
+
+/// Messages delivered to the app loop from background runs.
+pub enum AppMsg {
+    Engine(EngineEvent),
+    Planned { goal: String, nodes: Vec<NodeView> },
+    Finished(RunReport),
+    Failed(String),
+    Reindex,
+    /// A block of informational lines (e.g. `/workers`, `/connect` output).
+    Note(String),
+}
+
+/// The TUI application state.
+pub struct App {
+    goal: Option<String>,
+    nodes: Vec<NodeView>,
+    /// Lines committed and waiting to be flushed into terminal scrollback.
+    pending: Vec<FeedEntry>,
+    /// In-progress streamed text for the current node (token-level workers),
+    /// shown live in the viewport until a boundary commits it to scrollback.
+    live_tail: String,
+    live_node: Option<String>,
+    /// Workers that stream token-level fragments (API providers + grok), so the
+    /// feed accumulates their deltas into lines instead of one-fragment-per-line.
+    token_workers: HashSet<String>,
+    input: String,
+    running: bool,
+    parked: Option<String>,
+    picker: Option<Picker>,
+    completion: Option<Completion>,
+    index: FileIndex,
+    spinner: usize,
+    should_quit: bool,
+    cancel: Option<CancellationToken>,
+    tx: tokio::sync::mpsc::UnboundedSender<AppMsg>,
+}
+
+impl App {
+    fn new(
+        index: FileIndex,
+        tx: tokio::sync::mpsc::UnboundedSender<AppMsg>,
+        token_workers: HashSet<String>,
+    ) -> Self {
+        let mut app = Self {
+            goal: None,
+            nodes: Vec::new(),
+            pending: Vec::new(),
+            live_tail: String::new(),
+            live_node: None,
+            token_workers,
+            input: String::new(),
+            running: false,
+            parked: None,
+            picker: None,
+            completion: None,
+            index,
+            spinner: 0,
+            should_quit: false,
+            cancel: None,
+            tx,
+        };
+        app.push(FeedKind::System, "Welcome to Rinne. Describe what you want done and press Enter.");
+        app.push(FeedKind::System, "Type @ to reference files · /help for commands · ctrl-q to quit · scroll the terminal to see history.");
+        app
+    }
+
+    /// Queue a committed line for scrollback.
+    fn push(&mut self, kind: FeedKind, text: impl Into<String>) {
+        self.pending.push(FeedEntry { kind, text: text.into() });
+    }
+
+    /// Commit any in-progress streamed text to scrollback.
+    fn commit_tail(&mut self) {
+        if !self.live_tail.is_empty() {
+            let node = self.live_node.clone().unwrap_or_default();
+            let line = self.live_tail.trim().to_string();
+            if !line.is_empty() {
+                self.push(FeedKind::Stream, format!("{node}  {line}"));
+            }
+            self.live_tail.clear();
+        }
+        self.live_node = None;
+    }
+
+    /// Append streamed text for `id`, flushing each completed line to scrollback
+    /// and keeping the trailing partial line live. Token-level workers emit tiny
+    /// fragments (often mid-word); this reconstructs them into real lines instead
+    /// of printing one fragment per row.
+    fn stream_text(&mut self, id: &str, text: &str) {
+        if self.live_node.as_deref() != Some(id) {
+            self.commit_tail();
+            self.live_node = Some(id.to_string());
+        }
+        self.live_tail.push_str(text);
+        while let Some(nl) = self.live_tail.find('\n') {
+            let line = self.live_tail[..nl].trim_end().to_string();
+            self.live_tail.drain(..=nl);
+            let node = self.live_node.clone().unwrap_or_default();
+            self.push(FeedKind::Stream, format!("{node}  {line}"));
+        }
+    }
+
+    fn progress(&self) -> (usize, usize) {
+        let done = self
+            .nodes
+            .iter()
+            .filter(|n| n.status == NodeStatus::Succeeded)
+            .count();
+        (done, self.nodes.len())
+    }
+
+    fn apply(&mut self, msg: AppMsg) {
+        match msg {
+            AppMsg::Planned { goal, nodes } => {
+                self.commit_tail();
+                self.goal = Some(goal);
+                self.nodes = nodes;
+                self.running = true;
+                self.parked = None;
+                // Print the plan to scrollback as one block.
+                let mut listing = String::from("Plan:");
+                for n in &self.nodes {
+                    listing.push_str(&format!("\n  ○ {:<5} {}", n.id, n.role));
+                }
+                self.push(FeedKind::Conductor, listing);
+            }
+            AppMsg::Engine(ev) => self.apply_engine(ev),
+            AppMsg::Finished(report) => {
+                self.commit_tail();
+                self.running = false;
+                self.cancel = None;
+                for (id, status) in &report.node_statuses {
+                    if let Some(n) = self.nodes.iter_mut().find(|n| &n.id == id) {
+                        n.status = *status;
+                    }
+                }
+                match report.stop_reason {
+                    StopReason::Completed => self.push(
+                        FeedKind::NodeOk,
+                        format!(
+                            "done · {} iteration{} · {} tokens",
+                            report.total_iterations,
+                            if report.total_iterations == 1 { "" } else { "s" },
+                            report.total_usage.total_tokens()
+                        ),
+                    ),
+                    StopReason::NeedsHuman { node, question } => {
+                        self.parked = Some(question.clone());
+                        self.push(FeedKind::Parked, format!("parked at {node}: {question}"));
+                    }
+                    other => self.push(FeedKind::NodeFail, format!("stopped: {other:?}")),
+                }
+            }
+            AppMsg::Failed(e) => {
+                self.commit_tail();
+                self.running = false;
+                self.cancel = None;
+                self.push(FeedKind::NodeFail, e);
+            }
+            AppMsg::Reindex => self.index.refresh(),
+            AppMsg::Note(text) => {
+                self.commit_tail();
+                self.push(FeedKind::System, text);
+            }
+        }
+    }
+
+    fn apply_engine(&mut self, ev: EngineEvent) {
+        match ev {
+            EngineEvent::Narration(line) => {
+                self.commit_tail();
+                self.push(FeedKind::Conductor, line);
+            }
+            EngineEvent::NodeStarted { id, worker } => {
+                self.commit_tail();
+                if let Some(n) = self.nodes.iter_mut().find(|n| n.id == id) {
+                    n.worker = worker.clone();
+                    n.status = NodeStatus::Running;
+                }
+                self.push(FeedKind::NodeStart, format!("{id} → {worker}"));
+            }
+            EngineEvent::NodeStream { id, event } => {
+                use rinne_core::worker::WorkerEvent::*;
+                match event {
+                    Done => {}
+                    // Tool actions are discrete lines and break a text run.
+                    Reading(m) | Editing(m) | ToolUse(m) => {
+                        self.commit_tail();
+                        let t = m.trim();
+                        if !t.is_empty() {
+                            self.push(FeedKind::Stream, format!("{id}  {t}"));
+                        }
+                    }
+                    Message(m) | Raw(m) => {
+                        // Token-level workers (API providers, Grok) stream tiny
+                        // fragments — accumulate them and break on newlines.
+                        // Block-level workers (Claude) send whole semantic blocks,
+                        // so each is flushed as its own line.
+                        let worker = self
+                            .nodes
+                            .iter()
+                            .find(|n| n.id == id)
+                            .map(|n| n.worker.as_str())
+                            .unwrap_or("");
+                        let token_level =
+                            worker == "grok" || self.token_workers.contains(worker);
+                        let id = id.clone();
+                        self.stream_text(&id, &m);
+                        if !token_level {
+                            // Whole block: close the line so the next block starts fresh.
+                            self.commit_tail();
+                        }
+                    }
+                }
+            }
+            EngineEvent::NodeFinished { id, status } => {
+                self.commit_tail();
+                if let Some(n) = self.nodes.iter_mut().find(|n| n.id == id) {
+                    n.status = status;
+                }
+                let kind = if status == NodeStatus::Succeeded { FeedKind::NodeOk } else { FeedKind::NodeFail };
+                self.push(kind, format!("{id} {}", status.label()));
+            }
+            EngineEvent::Parked { id, question } => {
+                self.commit_tail();
+                if let Some(n) = self.nodes.iter_mut().find(|n| n.id == id) {
+                    n.status = NodeStatus::Parked;
+                }
+                self.parked = Some(question.clone());
+                self.push(FeedKind::Parked, question);
+            }
+        }
+    }
+
+    // ----- input handling -----------------------------------------------------
+
+    fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        if mods.contains(KeyModifiers::CONTROL)
+            && matches!(code, KeyCode::Char('c') | KeyCode::Char('q'))
+        {
+            self.should_quit = true;
+            return;
+        }
+
+        if self.picker.is_some() {
+            match code {
+                KeyCode::Up => {
+                    self.picker.as_mut().unwrap().up();
+                    return;
+                }
+                KeyCode::Down => {
+                    self.picker.as_mut().unwrap().down();
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    self.complete_picker();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.picker = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Command-completion overlay: arrows + Tab steer it; chars/Enter/Backspace
+        // fall through to normal handling (which re-computes the overlay).
+        if self.completion.is_some() {
+            match code {
+                KeyCode::Up => {
+                    self.completion.as_mut().unwrap().up();
+                    return;
+                }
+                KeyCode::Down => {
+                    self.completion.as_mut().unwrap().down();
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.complete_command();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.completion = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        match code {
+            KeyCode::Char(c) => {
+                self.input.push(c);
+                self.refresh_completions();
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+                self.refresh_completions();
+            }
+            // Re-summon completion (e.g. after Esc) on a slash line.
+            KeyCode::Tab => self.refresh_completions(),
+            KeyCode::Enter => self.submit(),
+            KeyCode::Esc => {
+                if self.running {
+                    self.pause();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn refresh_completions(&mut self) {
+        // A slash-command line drives the command-completion overlay and never
+        // the @-file picker (the two are mutually exclusive).
+        if self.input.starts_with('/') {
+            self.picker = None;
+            self.completion = complete::suggest(&self.input);
+            return;
+        }
+        self.completion = None;
+        let token = current_token(&self.input);
+        if let Some(rest) = token.strip_prefix('@') {
+            let mut picker = self.picker.take().unwrap_or_else(Picker::new);
+            picker.update(rest, &self.index);
+            self.picker = Some(picker);
+        } else {
+            self.picker = None;
+        }
+    }
+
+    /// Insert the highlighted command completion, replacing the current token,
+    /// then re-compute so the next argument's hints appear immediately.
+    fn complete_command(&mut self) {
+        let Some(comp) = &self.completion else { return };
+        let Some(item) = comp.selected() else {
+            self.completion = None;
+            return;
+        };
+        let value = item.value.clone();
+        let start = comp.token_start.min(self.input.len());
+        self.input.truncate(start);
+        self.input.push_str(&value);
+        self.input.push(' ');
+        self.completion = None;
+        self.refresh_completions();
+    }
+
+    fn complete_picker(&mut self) {
+        let Some(picker) = &self.picker else { return };
+        let Some(sel) = picker.selected().cloned() else {
+            self.picker = None;
+            return;
+        };
+        let start = self
+            .input
+            .rfind(|c: char| c.is_whitespace())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        self.input.truncate(start);
+        self.input.push('@');
+        self.input.push_str(&sel);
+        self.input.push(' ');
+        self.picker = None;
+    }
+
+    fn submit(&mut self) {
+        let text = self.input.trim().to_string();
+        self.input.clear();
+        self.picker = None;
+        self.completion = None;
+        if text.is_empty() {
+            return;
+        }
+        // Echo the input, redacting an API key in a `connect` command so it
+        // never lands in the transcript.
+        self.push(FeedKind::System, format!("› {}", redact_secret(&text)));
+
+        // A slash command, or a `rinne <cmd>` typed out of shell habit — both
+        // route to the command handler, never the conductor.
+        if let Some(cmd) = text.strip_prefix('/').or_else(|| text.strip_prefix("rinne ")) {
+            self.slash(cmd.trim());
+            return;
+        }
+        if self.parked.is_some() {
+            self.resume_with(HumanDecision::Steer(text));
+            return;
+        }
+        if self.running {
+            self.push(FeedKind::System, "a run is active — /pause first, or wait for it to park");
+            return;
+        }
+        match self.resolve_mentions(&text) {
+            Ok((goal, mentioned)) => self.start_goal(goal, mentioned),
+            Err(warning) => self.push(FeedKind::NodeFail, warning),
+        }
+    }
+
+    fn slash(&mut self, cmd: &str) {
+        let head = cmd.split_whitespace().next().unwrap_or("");
+        let rest = cmd[head.len()..].trim().to_string();
+        match head {
+            "help" => self.push(FeedKind::System, help_text()),
+            "plan" => {
+                let ids: Vec<&str> = self.nodes.iter().map(|n| n.id.as_str()).collect();
+                self.push(
+                    FeedKind::System,
+                    format!("plan: {}", if ids.is_empty() { "(none)".into() } else { ids.join(" → ") }),
+                );
+            }
+            "workers" | "doctor" => self.list_workers(),
+            "connect" => {
+                if rest.is_empty() {
+                    self.push(FeedKind::System, "usage: /connect <backend> [api-key] [--base-url <url>] [--model <id>]  (key is stored in your OS keychain)");
+                } else {
+                    let (backend, key, models, base_url, add) = parse_connect_args(&rest);
+                    self.connect(backend, key, models, base_url, add);
+                }
+            }
+            "forget" => {
+                if rest.is_empty() {
+                    self.push(FeedKind::System, "usage: /forget <provider>  (deletes the stored API key from your OS keychain)");
+                } else {
+                    let lines = crate::commands::forget::forget_lines(rest.split_whitespace().next().unwrap_or(""));
+                    self.push(FeedKind::System, lines.join("\n"));
+                }
+            }
+            "models" => {
+                if rest.is_empty() {
+                    self.push(FeedKind::System, "usage: /models <provider>  (lists the models an API provider's key can access)");
+                } else {
+                    self.list_models_for(rest.split_whitespace().next().unwrap_or("").to_string());
+                }
+            }
+            "config" => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let lines = crate::commands::config::edit_lines(&rest, &cwd);
+                self.push(FeedKind::System, lines.join("\n"));
+                // `/config edit` opens the file; non-blocking GUI/opener so the
+                // inline TUI keeps running (terminal editors: run from the shell).
+                let sub = rest.split_whitespace().next().unwrap_or("");
+                if matches!(sub, "edit" | "open") {
+                    let scope = if rest.contains("--project") || rest.contains("--proj") {
+                        rinne_config::write::Scope::Project
+                    } else {
+                        rinne_config::write::Scope::Global
+                    };
+                    if let Ok(path) = rinne_config::write::target_path(scope, &cwd) {
+                        crate::commands::config::open_in_editor(&path, false);
+                    }
+                }
+            }
+            "steer" if !rest.is_empty() => self.resume_with(HumanDecision::Steer(rest)),
+            "approve" => self.resume_with(HumanDecision::Approve),
+            "reject" => self.resume_with(HumanDecision::Reject),
+            "pause" => self.pause(),
+            "resume" => {
+                if self.parked.is_some() {
+                    self.push(FeedKind::System, "parked — use /approve, /reject, or /steer <text>");
+                } else {
+                    self.resume_plain();
+                }
+            }
+            "budget" => self.push(FeedKind::System, format!("budget noted: {rest} (applied next run)")),
+            "route" => self.push(FeedKind::System, format!("route override noted: {rest}")),
+            "logs" => self.push(FeedKind::System, "logs: .rinne/logs/"),
+            "quit" | "q" => self.should_quit = true,
+            "" => {}
+            other => self.push(
+                FeedKind::System,
+                format!("unknown command `{other}` — try /help. (To run something as a task, type it without a leading slash or `rinne`.)"),
+            ),
+        }
+    }
+
+    fn list_workers(&mut self) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let text = match crate::commands::connect::list_lines().await {
+                Ok(lines) => lines.join("\n"),
+                Err(e) => format!("could not list workers: {e}"),
+            };
+            let _ = tx.send(AppMsg::Note(text));
+        });
+    }
+
+    fn list_models_for(&mut self, provider: String) {
+        self.push(FeedKind::System, format!("fetching models for {provider}…"));
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let text = crate::commands::models::list_lines(&provider).await.join("\n");
+            let _ = tx.send(AppMsg::Note(text));
+        });
+    }
+
+    fn connect(&mut self, backend: String, key: Option<String>, models: Vec<String>, base_url: Option<String>, add: bool) {
+        self.push(FeedKind::System, format!("connecting {backend}…"));
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let text = match crate::commands::connect::connect_lines(&backend, key.as_deref(), &models, base_url.as_deref(), add).await {
+                Ok(lines) => lines.join("\n"),
+                Err(e) => format!("connect failed: {e}"),
+            };
+            let _ = tx.send(AppMsg::Note(text));
+        });
+    }
+
+    fn pause(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+            self.push(FeedKind::System, "paused — state saved; type to steer or /resume");
+        }
+    }
+
+    fn start_goal(&mut self, goal: String, mentioned: Vec<PathBuf>) {
+        let cancel = CancellationToken::new();
+        self.cancel = Some(cancel.clone());
+        self.running = true;
+        self.nodes.clear();
+        self.push(FeedKind::Conductor, format!("planning: {goal}"));
+        spawn_run(self.tx.clone(), goal, mentioned, None, cancel);
+    }
+
+    fn resume_with(&mut self, decision: HumanDecision) {
+        if self.parked.is_none() {
+            self.push(FeedKind::System, "nothing is parked");
+            return;
+        }
+        self.parked = None;
+        self.running = true;
+        let cancel = CancellationToken::new();
+        self.cancel = Some(cancel.clone());
+        let resume = ResumeInput { node: None, decision };
+        self.push(FeedKind::Conductor, "resuming with your decision");
+        spawn_run(self.tx.clone(), String::new(), Vec::new(), Some(resume), cancel);
+    }
+
+    fn resume_plain(&mut self) {
+        let cancel = CancellationToken::new();
+        self.cancel = Some(cancel.clone());
+        self.running = true;
+        self.push(FeedKind::Conductor, "resuming");
+        spawn_run(self.tx.clone(), String::new(), Vec::new(), None, cancel);
+    }
+
+    fn resolve_mentions(&self, input: &str) -> std::result::Result<(String, Vec<PathBuf>), String> {
+        let mut goal_words = Vec::new();
+        let mut mentioned: Vec<PathBuf> = Vec::new();
+
+        for token in input.split_whitespace() {
+            let Some(reference) = token.strip_prefix('@') else {
+                goal_words.push(token);
+                continue;
+            };
+            let resolved = self.resolve_one(reference);
+            if resolved.len() > GLOB_LIMIT {
+                return Err(format!(
+                    "`@{reference}` expands to {} files (>{GLOB_LIMIT}) — narrow it before running",
+                    resolved.len()
+                ));
+            }
+            mentioned.extend(resolved);
+        }
+
+        if mentioned.len() > GLOB_LIMIT {
+            return Err(format!(
+                "{} files mentioned (>{GLOB_LIMIT}) — narrow before running",
+                mentioned.len()
+            ));
+        }
+        mentioned.sort();
+        mentioned.dedup();
+        Ok((goal_words.join(" "), mentioned))
+    }
+
+    fn resolve_one(&self, reference: &str) -> Vec<PathBuf> {
+        let root = self.index.root();
+        if reference.contains('*') || reference.contains('?') {
+            let pattern = root.join(reference);
+            if let Ok(paths) = glob::glob(&pattern.to_string_lossy()) {
+                return paths
+                    .flatten()
+                    .filter(|p| p.is_file())
+                    .filter_map(|p| p.strip_prefix(root).ok().map(|r| r.to_path_buf()))
+                    .collect();
+            }
+            return Vec::new();
+        }
+        let as_dir = reference.trim_end_matches('/');
+        if root.join(as_dir).is_dir() {
+            let prefix = format!("{as_dir}/");
+            return self
+                .index
+                .files()
+                .iter()
+                .filter(|f| f.starts_with(&prefix))
+                .map(PathBuf::from)
+                .collect();
+        }
+        vec![PathBuf::from(reference)]
+    }
+}
+
+/// The current whitespace-delimited token at the end of `input`.
+fn current_token(input: &str) -> &str {
+    input.rsplit(char::is_whitespace).next().unwrap_or("")
+}
+
+/// Parse `connect` arguments: `<provider> [key] [--base-url <url>] [--model <id>]`
+/// with positional models also allowed after the key. Returns
+/// `(provider, key, models, base_url)`.
+fn parse_connect_args(rest: &str) -> (String, Option<String>, Vec<String>, Option<String>, bool) {
+    let mut toks = rest.split_whitespace();
+    let provider = toks.next().unwrap_or("").to_string();
+    let mut key = None;
+    let mut models = Vec::new();
+    let mut base_url = None;
+    let mut add = false;
+    while let Some(t) = toks.next() {
+        match t {
+            "--base-url" | "--base_url" => base_url = toks.next().map(String::from),
+            "--model" => {
+                if let Some(m) = toks.next() {
+                    models.push(m.to_string());
+                }
+            }
+            "--add" => add = true,
+            _ if t.starts_with("--") => {} // unknown flag: ignore
+            _ if key.is_none() => key = Some(t.to_string()),
+            _ => models.push(t.to_string()),
+        }
+    }
+    (provider, key, models, base_url, add)
+}
+
+/// Redact an API key in a `connect` line so it never appears in the transcript.
+fn redact_secret(text: &str) -> String {
+    let cmd = text
+        .strip_prefix('/')
+        .or_else(|| text.strip_prefix("rinne "))
+        .unwrap_or(text);
+    if let Some(args) = cmd.strip_prefix("connect ") {
+        let (_, key, _, _, _) = parse_connect_args(args.trim());
+        if let Some(k) = key {
+            if !k.is_empty() {
+                return text.replace(&k, "***");
+            }
+        }
+    }
+    // Redact a `--key <token>` value (e.g. `/config conductor cloudflare --key …`)
+    // and the positional token of `/config key <token>`.
+    let toks: Vec<&str> = cmd.split_whitespace().collect();
+    let mut secret: Option<&str> = None;
+    for (i, t) in toks.iter().enumerate() {
+        if *t == "--key" {
+            secret = toks.get(i + 1).copied();
+        }
+    }
+    if secret.is_none() && toks.first() == Some(&"config") && toks.get(1) == Some(&"key") {
+        secret = toks.get(2).copied();
+    }
+    if let Some(s) = secret {
+        if !s.is_empty() {
+            return text.replace(s, "***");
+        }
+    }
+    text.to_string()
+}
+
+/// The slash-command reference, formatted as command (left) · description
+/// (right). Newlines are preserved by the transcript renderer.
+fn help_text() -> String {
+    let rows = [
+        ("/plan", "show the current plan"),
+        ("/workers", "list workers + connected APIs and their auth"),
+        ("/connect <b>", "connect a harness, or an API provider + key (e.g. /connect deepseek sk-…)"),
+        ("/forget <p>", "delete a stored API key from the OS keychain"),
+        ("/models <p>", "list the models an API provider's key can access"),
+        ("/config", "show/edit config: conductor <b> [--key <t>], set <k> <v>, init, edit"),
+        ("/steer <text>", "give guidance to a parked node (or just type while parked)"),
+        ("/approve", "accept the current state and continue"),
+        ("/reject", "throw out the approach and replan"),
+        ("/pause", "pause the running loop (state is saved)"),
+        ("/resume", "resume a paused run"),
+        ("/budget <min>", "adjust the time budget"),
+        ("/route <n> <w>", "pin a node to a worker"),
+        ("/logs", "where logs are written (.rinne/logs/)"),
+        ("/quit", "exit (or ctrl-q)"),
+    ];
+    let mut s = String::from("commands:");
+    for (cmd, desc) in rows {
+        s.push_str(&format!("\n  {cmd:<18}{desc}"));
+    }
+    s
+}
+
+fn spawn_run(
+    tx: tokio::sync::mpsc::UnboundedSender<AppMsg>,
+    goal: String,
+    mentioned: Vec<PathBuf>,
+    resume: Option<ResumeInput>,
+    cancel: CancellationToken,
+) {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(AppMsg::Failed(format!("runtime: {e}")));
+                return;
+            }
+        };
+        rt.block_on(async move {
+            match do_run(tx.clone(), goal, mentioned, resume, cancel).await {
+                Ok(report) => {
+                    let _ = tx.send(AppMsg::Finished(report));
+                }
+                Err(e) => {
+                    let _ = tx.send(AppMsg::Failed(e.to_string()));
+                }
+            }
+        });
+    });
+}
+
+async fn do_run(
+    tx: tokio::sync::mpsc::UnboundedSender<AppMsg>,
+    goal: String,
+    mentioned: Vec<PathBuf>,
+    resume: Option<ResumeInput>,
+    cancel: CancellationToken,
+) -> Result<RunReport> {
+    let config = rinne_config::load_cwd()?;
+    let cwd = std::env::current_dir()?;
+    let bb = Blackboard::open(&cwd)?;
+    let (registry, _) = runner::build_registry(&config).await?;
+    if registry.is_empty() {
+        return Err(anyhow!("no available workers — run `rinne doctor`"));
+    }
+    let conductor = runner::build_conductor(&config, &registry, cwd.clone())
+        .ok()
+        .map(Arc::new);
+
+    if resume.is_none() {
+        let conductor = conductor
+            .clone()
+            .ok_or_else(|| anyhow!("no conductor backend available"))?;
+        let input = ConductorInput {
+            goal: goal.clone(),
+            mentioned,
+            workers: registry.descriptors(),
+            budget_minutes: Some(config.loop_.global_budget_minutes as u64),
+            max_iterations_per_node: config.loop_.max_iterations_per_node,
+            ..Default::default()
+        };
+        let plan = conductor.plan(&input).await?;
+        bb.save_plan(&plan)?;
+        bb.reset_run()?;
+    }
+
+    let plan = bb.load_plan()?;
+    let nodes = plan
+        .nodes
+        .iter()
+        .map(|n| NodeView {
+            id: n.id.clone(),
+            role: format!("{:?}", n.role).to_lowercase(),
+            status: NodeStatus::Pending,
+            worker: String::new(),
+        })
+        .collect();
+    let goal_label = if goal.is_empty() { plan.goal.clone() } else { goal };
+    let _ = tx.send(AppMsg::Planned { goal: goal_label, nodes });
+
+    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<EngineEvent>();
+    let ftx = tx.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = erx.recv().await {
+            let _ = ftx.send(AppMsg::Engine(ev));
+        }
+    });
+
+    let mut engine = Engine::new(&bb, plan, &registry, runner::options_with_pool(&config, &registry));
+    if let Some(c) = &conductor {
+        engine = engine.with_replanner(c.clone());
+    }
+    engine.run(cancel, Some(etx), resume).await.map_err(Into::into)
+}
+
+/// Entry point: set up an inline viewport and run the event loop.
+pub async fn run() -> Result<()> {
+    if !io::stdout().is_terminal() {
+        println!("rinne: the interactive TUI needs a terminal. Use `rinne -p \"<task>\"` for headless runs.");
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir()?;
+    let index = FileIndex::build(&cwd);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppMsg>();
+
+    let (watch_tx, mut watch_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let _watcher = index::watch(&cwd, watch_tx);
+    let reindex_tx = tx.clone();
+    tokio::spawn(async move {
+        while watch_rx.recv().await.is_some() {
+            while watch_rx.try_recv().is_ok() {}
+            let _ = reindex_tx.send(AppMsg::Reindex);
+        }
+    });
+
+    // API providers stream token-level fragments; tell the feed so it coalesces
+    // their deltas into lines (same as grok) instead of one fragment per row.
+    let token_workers: HashSet<String> = rinne_config::load_cwd()
+        .ok()
+        .map(|c| c.backends.api.providers.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut app = App::new(index, tx, token_workers);
+
+    // No alternate screen: the transcript stays in normal scrollback. A small
+    // inline viewport at the bottom holds the live region.
+    enable_raw_mode()?;
+    let rows = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
+    let viewport_height = rows.saturating_sub(1).min(10).max(4);
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(viewport_height),
+        },
+    )?;
+
+    let result = event_loop(&mut terminal, &mut app, &mut rx).await;
+
+    // Leave the transcript intact; just drop the live region and free the line.
+    let _ = terminal.clear();
+    disable_raw_mode()?;
+    println!();
+    result
+}
+
+async fn event_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppMsg>,
+) -> Result<()> {
+    let mut events = EventStream::new();
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
+
+    loop {
+        ui::flush_pending(terminal, app)?;
+        terminal.draw(|f| ui::draw_viewport(f, app))?;
+        if app.should_quit {
+            return Ok(());
+        }
+
+        tokio::select! {
+            maybe_event = events.next() => {
+                match maybe_event {
+                    Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
+                        app.on_key(key.code, key.modifiers);
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => return Ok(()),
+                }
+            }
+            Some(msg) = rx.recv() => app.apply(msg),
+            _ = tick.tick() => app.spinner = app.spinner.wrapping_add(1),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("rinne-tui-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn app_for(dir: &std::path::Path) -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(FileIndex::build(dir), tx, HashSet::new())
+    }
+
+    #[test]
+    fn current_token_picks_trailing_word() {
+        assert_eq!(current_token("fix @src/li"), "@src/li");
+        assert_eq!(current_token("hello world"), "world");
+        assert_eq!(current_token(""), "");
+    }
+
+    #[test]
+    fn connect_args_parse_flags() {
+        let (p, k, models, base, add) = parse_connect_args(
+            "deepseek my-key --base-url https://integrate.api.nvidia.com/v1 --model deepseek-ai/deepseek-v4-pro --add",
+        );
+        assert_eq!(p, "deepseek");
+        assert_eq!(k.as_deref(), Some("my-key"));
+        assert_eq!(models, vec!["deepseek-ai/deepseek-v4-pro"]);
+        assert_eq!(base.as_deref(), Some("https://integrate.api.nvidia.com/v1"));
+        assert!(add);
+    }
+
+    #[test]
+    fn connect_args_positional_models() {
+        let (p, k, models, base, add) = parse_connect_args("nvidia mykey model-a model-b");
+        assert_eq!(p, "nvidia");
+        assert_eq!(k.as_deref(), Some("mykey"));
+        assert_eq!(models, vec!["model-a", "model-b"]);
+        assert_eq!(base, None);
+        assert!(!add);
+    }
+
+    #[test]
+    fn token_fragments_coalesce_into_lines() {
+        let dir = temp_dir("stream");
+        let mut app = app_for(&dir);
+        // Token-level workers stream tiny fragments (often mid-word). These must
+        // accumulate into one line, not one-fragment-per-row.
+        app.stream_text("n1", "Hel");
+        app.stream_text("n1", "lo wor");
+        app.stream_text("n1", "ld\nsecond line");
+        // The completed line flushed; the partial remainder stays live.
+        let flushed: Vec<&str> = app.pending.iter().map(|e| e.text.as_str()).collect();
+        assert!(flushed.iter().any(|t| *t == "n1  Hello world"), "got: {flushed:?}");
+        assert_eq!(app.live_tail, "second line");
+        app.commit_tail();
+        assert!(app.pending.iter().any(|e| e.text == "n1  second line"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redact_hides_key_keeps_flags() {
+        let r = redact_secret("/connect deepseek SECRETKEY --base-url https://x --model m");
+        assert!(!r.contains("SECRETKEY"), "key leaked: {r}");
+        assert!(r.contains("--base-url") && r.contains("https://x") && r.contains("***"));
+    }
+
+    #[test]
+    fn redact_hides_conductor_token() {
+        let r = redact_secret("/config conductor cloudflare @cf/llama --key TOKEN123 --project");
+        assert!(!r.contains("TOKEN123"), "token leaked: {r}");
+        assert!(r.contains("cloudflare") && r.contains("--project") && r.contains("***"), "{r}");
+        // positional form: /config key <token>
+        let r2 = redact_secret("/config key TOKEN456");
+        assert!(!r2.contains("TOKEN456"), "token leaked: {r2}");
+    }
+
+    #[test]
+    fn resolves_file_reference_and_strips_at_from_goal() {
+        let dir = temp_dir("file");
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let app = app_for(&dir);
+
+        let (goal, mentioned) = app.resolve_mentions("@a.txt fix the bug").unwrap();
+        assert_eq!(goal, "fix the bug");
+        assert_eq!(mentioned, vec![PathBuf::from("a.txt")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expands_a_directory_mention() {
+        let dir = temp_dir("dir");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "x").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "y").unwrap();
+        let app = app_for(&dir);
+
+        let (_goal, mentioned) = app.resolve_mentions("@src/ refactor").unwrap();
+        assert_eq!(mentioned.len(), 2);
+        assert!(mentioned.contains(&PathBuf::from("src/a.rs")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_guardrail_trips_past_the_limit() {
+        let dir = temp_dir("glob");
+        for i in 0..(GLOB_LIMIT + 5) {
+            std::fs::write(dir.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let app = app_for(&dir);
+
+        let err = app.resolve_mentions("@*.txt do it").unwrap_err();
+        assert!(err.contains("narrow"), "should warn to narrow: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
