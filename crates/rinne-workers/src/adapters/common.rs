@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use rinne_core::worker::{
-    EventSink, ExecStatus, ExecuteRequest, ExecuteResult, Usage, Worker, WorkerDescriptor,
+    emit, EventSink, ExecStatus, ExecuteRequest, ExecuteResult, Usage, Worker, WorkerDescriptor,
+    WorkerEvent,
 };
 use rinne_core::Result;
 
@@ -40,8 +41,53 @@ impl ParsedHarness {
     }
 }
 
-/// Build the argv for a harness invocation given the composed prompt.
-pub type ArgsBuilder = fn(prompt: &str) -> Vec<String>;
+/// Build the argv for a harness invocation given the composed prompt and an
+/// optional model selection.
+pub type ArgsBuilder = fn(prompt: &str, model: Option<&str>) -> Vec<String>;
+
+/// Defensive parser for harnesses that emit a single JSON result object: probe
+/// common result fields, falling back to raw stdout on any surprise
+/// (`CONTEXT.md` §21). Suitable for not-yet-pinned beta CLIs.
+pub fn parse_generic_json(out: &SubprocessOutput) -> ParsedHarness {
+    let pick = |v: &serde_json::Value| {
+        v.get("result")
+            .or_else(|| v.get("text"))
+            .or_else(|| v.get("message"))
+            .or_else(|| v.get("content"))
+            .or_else(|| v.get("response"))
+            .and_then(|x| x.as_str())
+            .map(String::from)
+    };
+    for line in out.stdout.lines().rev() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(result) = pick(&v) {
+                let session_id = v
+                    .get("session_id")
+                    .or_else(|| v.get("sessionId"))
+                    .and_then(|x| x.as_str())
+                    .map(String::from);
+                let is_error = v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
+                return ParsedHarness {
+                    result,
+                    session_id,
+                    usage: Usage::default(),
+                    is_error,
+                };
+            }
+        }
+    }
+    ParsedHarness::raw(&out.stdout)
+}
+
+/// The trivial parser: the captured stdout is the result (for CLIs that print
+/// plain text, e.g. Aider).
+pub fn parse_raw(out: &SubprocessOutput) -> ParsedHarness {
+    ParsedHarness::raw(&out.stdout)
+}
 /// Parse a harness CLI's captured output into normalized fields.
 pub type OutputParser = fn(out: &SubprocessOutput) -> ParsedHarness;
 
@@ -78,21 +124,52 @@ impl Worker for HarnessAdapter {
             .map(Duration::from_secs)
             .unwrap_or(self.default_timeout);
 
+        let model = request.constraints.model.as_deref();
         let (args, stdin) = if self.prompt_via_stdin {
-            ((self.build_args)(""), Some(prompt))
+            ((self.build_args)("", model), Some(prompt))
         } else {
-            ((self.build_args)(&prompt), None)
+            ((self.build_args)(&prompt, model), None)
         };
 
-        let spec = SubprocessSpec {
-            program: self.program.clone(),
-            args,
-            workspace: request.workspace.clone(),
-            stdin,
-            timeout: Some(timeout),
+        // Retry transient failures (spawn errors, timeouts) once before giving
+        // up — beta CLIs are flaky (`CONTEXT.md` §21). A cancelled run is not
+        // retried.
+        const MAX_ATTEMPTS: u32 = 2;
+        let mut attempt = 0;
+        let out = loop {
+            attempt += 1;
+            let spec = SubprocessSpec {
+                program: self.program.clone(),
+                args: args.clone(),
+                workspace: request.workspace.clone(),
+                stdin: stdin.clone(),
+                timeout: Some(timeout),
+            };
+            match subprocess::run(spec, &events, &cancel, self.line_mapper).await {
+                Ok(out) => {
+                    let timed_out = matches!(out.status, ExecStatus::TimedOut);
+                    if timed_out && attempt < MAX_ATTEMPTS && !cancel.is_cancelled() {
+                        emit(&events, WorkerEvent::Message(format!(
+                            "{} timed out — retrying ({attempt}/{MAX_ATTEMPTS})",
+                            self.program
+                        )));
+                        continue;
+                    }
+                    break out;
+                }
+                Err(e) => {
+                    if attempt < MAX_ATTEMPTS && !cancel.is_cancelled() {
+                        emit(&events, WorkerEvent::Message(format!(
+                            "{} failed to start ({e}) — retrying ({attempt}/{MAX_ATTEMPTS})",
+                            self.program
+                        )));
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
         };
-
-        let out = subprocess::run(spec, &events, &cancel, self.line_mapper).await?;
         let parsed = (self.parse)(&out);
 
         // Reconcile the transport-level status with the parsed error flag.
