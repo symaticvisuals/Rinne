@@ -1,9 +1,17 @@
 [package]
-name = "rinne-cli"
+name = "rinne"
+description = "Local, terminal-first AI orchestration: plan work into a DAG and drive it across AI coding CLIs and model APIs through a verifying loop."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+# The published binary is `rinne`; install with `cargo install rinne`.
+default-run = "rinne"
 
 [[bin]]
 name = "rinne"

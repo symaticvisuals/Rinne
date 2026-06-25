@@ -13,14 +13,17 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/rinne/rinne"
+repository = "https://github.com/GIKSN-RESEARCH/Rinne"
+homepage = "https://github.com/GIKSN-RESEARCH/Rinne"
+keywords = ["ai", "orchestration", "agent", "llm", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-# Internal crates
-rinne-core = { path = "crates/rinne-core" }
-rinne-conductor = { path = "crates/rinne-conductor" }
-rinne-workers = { path = "crates/rinne-workers" }
-rinne-config = { path = "crates/rinne-config" }
+# Internal crates — path for local builds, version for crates.io publishing.
+rinne-core = { path = "crates/rinne-core", version = "0.1.0" }
+rinne-conductor = { path = "crates/rinne-conductor", version = "0.1.0" }
+rinne-workers = { path = "crates/rinne-workers", version = "0.1.0" }
+rinne-config = { path = "crates/rinne-config", version = "0.1.0" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
