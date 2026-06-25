@@ -8,6 +8,7 @@
 
 mod index;
 mod complete;
+mod markdown;
 mod picker;
 mod ui;
 
@@ -47,12 +48,14 @@ pub struct NodeView {
 }
 
 /// The kind of transcript entry, which drives its glyph, indent, and color.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum FeedKind {
     System,
     Conductor,
     NodeStart,
     Stream,
+    /// A completed worker message, rendered as terminal markdown.
+    Markdown,
     NodeOk,
     NodeFail,
     Parked,
@@ -63,6 +66,8 @@ pub enum FeedKind {
 pub struct FeedEntry {
     pub kind: FeedKind,
     pub text: String,
+    /// The node id this entry belongs to, shown as a gutter for worker output.
+    pub node: Option<String>,
 }
 
 /// Messages delivered to the app loop from background runs.
@@ -132,38 +137,34 @@ impl App {
 
     /// Queue a committed line for scrollback.
     fn push(&mut self, kind: FeedKind, text: impl Into<String>) {
-        self.pending.push(FeedEntry { kind, text: text.into() });
+        self.pending.push(FeedEntry { kind, text: text.into(), node: None });
     }
 
-    /// Commit any in-progress streamed text to scrollback.
+    /// Commit the accumulated worker message as one markdown block (rendered to
+    /// scrollback at flush time), tagged with its node for a gutter.
     fn commit_tail(&mut self) {
-        if !self.live_tail.is_empty() {
-            let node = self.live_node.clone().unwrap_or_default();
-            let line = self.live_tail.trim().to_string();
-            if !line.is_empty() {
-                self.push(FeedKind::Stream, format!("{node}  {line}"));
-            }
-            self.live_tail.clear();
+        if !self.live_tail.trim().is_empty() {
+            let node = self.live_node.clone();
+            self.pending.push(FeedEntry {
+                kind: FeedKind::Markdown,
+                text: std::mem::take(&mut self.live_tail).trim().to_string(),
+                node,
+            });
         }
+        self.live_tail.clear();
         self.live_node = None;
     }
 
-    /// Append streamed text for `id`, flushing each completed line to scrollback
-    /// and keeping the trailing partial line live. Token-level workers emit tiny
-    /// fragments (often mid-word); this reconstructs them into real lines instead
-    /// of printing one fragment per row.
+    /// Append streamed text for `id`. The whole message accumulates (shown live
+    /// in the viewport) and is rendered as one markdown block when a boundary —
+    /// a node switch, a tool action, or completion — commits it. This is what
+    /// makes worker output read like Claude Code instead of one token per row.
     fn stream_text(&mut self, id: &str, text: &str) {
         if self.live_node.as_deref() != Some(id) {
             self.commit_tail();
             self.live_node = Some(id.to_string());
         }
         self.live_tail.push_str(text);
-        while let Some(nl) = self.live_tail.find('\n') {
-            let line = self.live_tail[..nl].trim_end().to_string();
-            self.live_tail.drain(..=nl);
-            let node = self.live_node.clone().unwrap_or_default();
-            self.push(FeedKind::Stream, format!("{node}  {line}"));
-        }
     }
 
     fn progress(&self) -> (usize, usize) {
@@ -981,20 +982,24 @@ mod tests {
     }
 
     #[test]
-    fn token_fragments_coalesce_into_lines() {
+    fn token_fragments_accumulate_into_one_markdown_block() {
         let dir = temp_dir("stream");
         let mut app = app_for(&dir);
-        // Token-level workers stream tiny fragments (often mid-word). These must
-        // accumulate into one line, not one-fragment-per-row.
+        let before = app.pending.len(); // welcome lines
+        // Token-level workers stream tiny fragments (often mid-word). The whole
+        // message accumulates live, then commits as ONE markdown block tagged
+        // with its node — not one fragment (or line) per scrollback row.
         app.stream_text("n1", "Hel");
         app.stream_text("n1", "lo wor");
         app.stream_text("n1", "ld\nsecond line");
-        // The completed line flushed; the partial remainder stays live.
-        let flushed: Vec<&str> = app.pending.iter().map(|e| e.text.as_str()).collect();
-        assert!(flushed.iter().any(|t| *t == "n1  Hello world"), "got: {flushed:?}");
-        assert_eq!(app.live_tail, "second line");
+        assert_eq!(app.pending.len(), before, "nothing should flush mid-stream");
+        assert_eq!(app.live_tail, "Hello world\nsecond line");
         app.commit_tail();
-        assert!(app.pending.iter().any(|e| e.text == "n1  second line"));
+        assert_eq!(app.pending.len(), before + 1);
+        let entry = app.pending.last().unwrap();
+        assert_eq!(entry.kind, FeedKind::Markdown);
+        assert_eq!(entry.node.as_deref(), Some("n1"));
+        assert_eq!(entry.text, "Hello world\nsecond line");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

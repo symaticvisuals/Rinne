@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Widget};
 use ratatui::{Frame, Terminal};
 
-use super::{App, FeedKind};
+use super::{markdown, App, FeedKind};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -194,11 +194,32 @@ fn draw_prompt(f: &mut Frame, area: Rect, app: &App, wrapped: &[String]) {
 
 /// Render one transcript entry into styled, word-wrapped lines for scrollback.
 fn render_entry(entry: FeedEntryRef, width: usize) -> Vec<Line<'static>> {
+    // A completed worker message: render it as terminal markdown, indented under
+    // a single dim node gutter, instead of one raw line per token.
+    if entry.kind == FeedKind::Markdown {
+        let indent = 4usize;
+        let avail = width.saturating_sub(indent + 1).max(24);
+        let mut out: Vec<Line<'static>> = Vec::new();
+        if let Some(node) = entry.node {
+            out.push(Line::from(Span::styled(
+                format!("  ⎿ {node}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        for line in markdown::render(entry.text, avail) {
+            let mut spans = vec![Span::raw(" ".repeat(indent))];
+            spans.extend(line.spans);
+            out.push(Line::from(spans));
+        }
+        return out;
+    }
+
     let (glyph, color, bold) = match entry.kind {
         FeedKind::System => ("", Color::Gray, false),
         FeedKind::Conductor => ("· ", Color::Cyan, false),
         FeedKind::NodeStart => ("▶ ", Color::Blue, true),
         FeedKind::Stream => ("  ⎿ ", Color::DarkGray, false),
+        FeedKind::Markdown => unreachable!("handled above"),
         FeedKind::NodeOk => ("✔ ", Color::Green, false),
         FeedKind::NodeFail => ("✗ ", Color::Red, false),
         FeedKind::Parked => ("⏸ ", Color::Yellow, false),
@@ -247,11 +268,12 @@ fn render_entry(entry: FeedEntryRef, width: usize) -> Vec<Line<'static>> {
 struct FeedEntryRef<'a> {
     kind: FeedKind,
     text: &'a str,
+    node: Option<&'a str>,
 }
 
 impl<'a> From<&'a super::FeedEntry> for FeedEntryRef<'a> {
     fn from(e: &'a super::FeedEntry) -> Self {
-        FeedEntryRef { kind: e.kind, text: &e.text }
+        FeedEntryRef { kind: e.kind, text: &e.text, node: e.node.as_deref() }
     }
 }
 
@@ -340,6 +362,7 @@ mod tests {
         let entry = FeedEntry {
             kind: FeedKind::Stream,
             text: "- tip one\n- tip two\n- tip three".to_string(),
+            node: None,
         };
         let lines = render_entry((&entry).into(), 80);
         assert_eq!(lines.len(), 3);
@@ -352,6 +375,7 @@ mod tests {
         let entry = FeedEntry {
             kind: FeedKind::System,
             text: "  /plan             show the current plan".to_string(),
+            node: None,
         };
         let lines = render_entry((&entry).into(), 80);
         assert_eq!(lines.len(), 1);
