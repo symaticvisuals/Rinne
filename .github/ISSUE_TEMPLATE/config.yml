@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🙏 Questions & help (Q&A)
+    url: https://github.com/GIKSN-RESEARCH/Rinne/discussions/categories/q-a
+    about: "Stuck or unsure how something works? Ask in Discussions — not Issues."
+  - name: 💡 Ideas & feature brainstorming
+    url: https://github.com/GIKSN-RESEARCH/Rinne/discussions/categories/ideas
+    about: "Open-ended ideas start here. Concrete, scoped requests can use the feature template."
+  - name: 🔐 Report a security vulnerability (private)
+    url: https://github.com/GIKSN-RESEARCH/Rinne/security/policy
+    about: "Never report vulnerabilities in public Issues or Discussions. Use the private advisory flow."

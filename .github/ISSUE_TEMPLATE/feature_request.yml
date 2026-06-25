@@ -1,0 +1,40 @@
+name: 💡 Feature request
+description: Propose a new capability or improvement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea? Great. For open-ended brainstorming, the **Ideas**
+        [Discussion](https://github.com/GIKSN-RESEARCH/Rinne/discussions) is often
+        a better first stop — but a concrete, scoped request belongs here.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that's hard or impossible today? Describe the problem before the solution.
+      placeholder: "When I ... I can't ... because ..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Rinne to do? A command, flag, config option, behavior change?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you've tried, or other approaches you weighed.
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Which workers/providers does this touch? Anything else that helps.
+    validations:
+      required: false

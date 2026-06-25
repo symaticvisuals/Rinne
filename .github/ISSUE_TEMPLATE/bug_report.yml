@@ -1,0 +1,91 @@
+name: 🐛 Bug report
+description: Something in Rinne is broken or behaves unexpectedly.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill out the fields below.
+
+        ### 🔐 Never paste secrets
+        Do **not** include API keys, tokens, or full `connect` / `--key` commands.
+        Rinne redacts secrets in its own output, but pasted shell history won't be.
+        Replace any secret with `***`. If you've exposed one, **rotate it now**.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: A clear description of the bug, and what you expected instead.
+      placeholder: |
+        I ran ... and expected ... but got ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The command/prompt you ran (secrets redacted to ***) and the steps to trigger it.
+      placeholder: |
+        1. rinne
+        2. typed: summarise @README.md. Use openrouter as generator
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: rinne --version
+      placeholder: "0.1.2"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install Rinne?
+      options:
+        - cargo install rinne
+        - Built from source (cargo build)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: OS + terminal
+      placeholder: "macOS 15 / iTerm2  ·  or  Ubuntu 24.04 / kitty"
+    validations:
+      required: true
+  - type: input
+    id: worker
+    attributes:
+      label: Worker(s) involved
+      description: Harness name (claude-code, codex, grok, …) or API provider/model.
+      placeholder: "API: openrouter / openai/gpt-4o-mini   ·   or   harness: claude-code"
+    validations:
+      required: false
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`rinne doctor` output"
+      description: Paste the output — it reports workers and auth mode and never prints keys.
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Re-run with `-vv`; logs are written to `.rinne/logs/`. Paste relevant excerpts, scrubbed of anything sensitive.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I removed all API keys/tokens from this report (replaced with `***`).
+          required: true
+        - label: I searched existing issues and this isn't a duplicate.
+          required: true

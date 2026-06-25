@@ -1,0 +1,37 @@
+title: "[Q&A]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### 🔐 Never paste secrets
+        No API keys, tokens, or full `connect` / `--key` commands. Replace with `***`.
+        If you've exposed one, **rotate it now**.
+  - type: textarea
+    id: question
+    attributes:
+      label: What are you trying to do?
+      description: Describe your goal and what's not working or unclear. Include the prompt/command you ran (secrets redacted).
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: rinne --version
+      placeholder: "0.1.2"
+    validations:
+      required: false
+  - type: input
+    id: env
+    attributes:
+      label: OS + terminal
+      placeholder: "macOS 15 / iTerm2"
+    validations:
+      required: false
+  - type: input
+    id: worker
+    attributes:
+      label: Worker / provider involved
+      placeholder: "API: openrouter / openai/gpt-4o-mini  ·  or harness: claude-code"
+    validations:
+      required: false
