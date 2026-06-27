@@ -49,6 +49,40 @@ const HISTORY_MAX: usize = 1000;
 /// Recent actions kept per agent in the live view.
 const ACTIONS_PER_AGENT: usize = 4;
 
+/// Whether an engine narration line is internal routing jargon that the user
+/// view should hide (the role-named flow shows this information cleanly). The
+/// engine still emits these for logs; we only suppress them in the TUI.
+fn is_internal_narration(line: &str) -> bool {
+    let l = line.trim_start();
+    // "routed n1 (Generator) to claude-code [harness]"
+    l.starts_with("routed ") || looks_like_node_routing(l)
+}
+
+/// Heuristic: a bare "<id> on <worker>:<model>" routing line — a single-token id
+/// before " on ", and a single-token "worker:model" after it.
+fn looks_like_node_routing(l: &str) -> bool {
+    match l.split_once(" on ") {
+        Some((head, tail)) => {
+            let head_is_id = head.split_whitespace().count() == 1 && !head.is_empty();
+            let tail_is_worker_model = tail.contains(':') && tail.split_whitespace().count() == 1;
+            head_is_id && tail_is_worker_model
+        }
+        None => false,
+    }
+}
+
+/// Height of the inline live viewport for a terminal of `rows` rows. The viewport
+/// is bottom-anchored, so when idle it still reads as a compact footer (the
+/// internal layout pushes status+prompt to the bottom); the extra rows give the
+/// live agents flow room to grow when a run is active. Capped at ~60% of the
+/// terminal so the transcript above stays visible, with a sensible floor.
+fn viewport_height_for(rows: u16) -> u16 {
+    let sixty_pct = (rows as u32 * 6 / 10) as u16;
+    // Prefer 60% (clamped to a 6..=24 band), but never exceed the terminal.
+    let preferred = sixty_pct.clamp(6, 24);
+    preferred.min(rows.saturating_sub(1)).max(1)
+}
+
 /// Map a worker action event to a friendly, verb-first label (Claude-Code
 /// style). Returns `None` for non-action events. Adapter payloads already carry
 /// human text; this only normalises the leading verb and strips redundant
@@ -294,10 +328,10 @@ impl App {
                 self.live_actions.clear();
                 self.running = true;
                 self.parked = None;
-                // Print the plan to scrollback as one block.
+                // Print the plan to scrollback as one block, by role (no ids).
                 let mut listing = String::from("Plan:");
                 for n in &self.nodes {
-                    listing.push_str(&format!("\n  ○ {:<5} {}", n.id, n.role));
+                    listing.push_str(&format!("\n  ○ {}", n.role));
                 }
                 self.push(FeedKind::Conductor, listing);
             }
@@ -346,15 +380,26 @@ impl App {
         match ev {
             EngineEvent::Narration(line) => {
                 self.commit_tail();
-                self.push(FeedKind::Conductor, line);
+                // Hide engine routing jargon ("routed n1 (Generator) to X
+                // [harness]", "n1 on X:model") from the user view; it stays in
+                // the engine's own narration for logs.
+                if !is_internal_narration(&line) {
+                    self.push(FeedKind::Conductor, line);
+                }
             }
             EngineEvent::NodeStarted { id, worker } => {
                 self.commit_tail();
+                let role = self
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == id)
+                    .map(|n| n.role.clone())
+                    .unwrap_or_else(|| id.clone());
                 if let Some(n) = self.nodes.iter_mut().find(|n| n.id == id) {
                     n.worker = worker.clone();
                     n.status = NodeStatus::Running;
                 }
-                self.push(FeedKind::NodeStart, format!("{id} → {worker}"));
+                self.push(FeedKind::NodeStart, format!("{role}  {worker}"));
             }
             EngineEvent::NodeStream { id, event } => {
                 use rinne_core::worker::WorkerEvent::*;
@@ -1181,7 +1226,7 @@ pub async fn run() -> Result<()> {
     // failure here returns early with only raw mode to undo — never a terminal
     // left in bracketed-paste / keyboard-enhancement state.
     let rows = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
-    let viewport_height = rows.saturating_sub(1).min(10).max(4);
+    let viewport_height = viewport_height_for(rows);
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = match Terminal::with_options(
         backend,
@@ -1667,5 +1712,50 @@ mod tests {
         for (ev, want) in cases {
             assert_eq!(super::action_label(&ev).as_deref(), want, "for {ev:?}");
         }
+    }
+
+    #[test]
+    fn viewport_height_scales_and_clamps() {
+        assert_eq!(super::viewport_height_for(24), 14); // 60% of 24
+        assert_eq!(super::viewport_height_for(80), 24); // capped at 24
+        assert_eq!(super::viewport_height_for(10), 6);  // floor of 6
+        assert_eq!(super::viewport_height_for(5), 4);   // never exceeds rows-1
+        assert_eq!(super::viewport_height_for(1), 1);   // degenerate
+    }
+
+    #[test]
+    fn internal_narration_is_hidden() {
+        // Jargon lines suppressed in the user view.
+        assert!(super::is_internal_narration("routed n1 (Generator) to claude-code [harness]"));
+        assert!(super::is_internal_narration("n1 on claude-code:sonnet"));
+        // Ordinary narration kept.
+        assert!(!super::is_internal_narration("planning: help me understand the project"));
+        assert!(!super::is_internal_narration("resuming with your decision"));
+        assert!(!super::is_internal_narration("waiting on human input")); // " on " but not id:worker:model
+    }
+
+    #[test]
+    fn plan_listing_uses_roles_not_ids() {
+        let mut app = app_for(&temp_dir("planlist"));
+        app.apply(AppMsg::Planned {
+            goal: "g".into(),
+            nodes: vec![
+                NodeView { id: "n1".into(), role: "generator".into(), status: NodeStatus::Pending, worker: String::new() },
+                NodeView { id: "n2".into(), role: "evaluator".into(), status: NodeStatus::Pending, worker: String::new() },
+            ],
+        });
+        let plan = app.pending.iter().find(|e| e.text.starts_with("Plan:")).expect("plan entry");
+        assert!(plan.text.contains("generator") && plan.text.contains("evaluator"), "{}", plan.text);
+        assert!(!plan.text.contains("n1") && !plan.text.contains("n2"), "ids leaked: {}", plan.text);
+    }
+
+    #[test]
+    fn node_started_heading_uses_role() {
+        let mut app = app_for(&temp_dir("nodestart"));
+        app.nodes = vec![NodeView { id: "n1".into(), role: "generator".into(), status: NodeStatus::Pending, worker: String::new() }];
+        app.apply_engine(EngineEvent::NodeStarted { id: "n1".into(), worker: "claude-code".into() });
+        let start = app.pending.iter().find(|e| e.kind == FeedKind::NodeStart).expect("node start entry");
+        assert!(start.text.contains("generator") && start.text.contains("claude-code"), "{}", start.text);
+        assert!(!start.text.contains("n1"), "id leaked: {}", start.text);
     }
 }

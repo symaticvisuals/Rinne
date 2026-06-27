@@ -53,16 +53,20 @@ pub fn draw_viewport(f: &mut Frame, app: &App) {
     let wrapped_input = wrap_input(app.input_str(), prompt_inner_w);
     let input_h = (wrapped_input.len() as u16 + 2).min(area.height.saturating_sub(2)).max(3);
 
+    // Bottom-anchored: the live region (agents flow / picker / tail) fills the
+    // space ABOVE the status+prompt footer. When idle it's empty, so the fill
+    // collapses status+prompt to the bottom — no floating status in a tall,
+    // otherwise-empty viewport (e.g. right after /clear).
     let chunks = Layout::vertical([
-        Constraint::Length(1),       // status
-        Constraint::Min(0),          // live tail / picker
+        Constraint::Min(0),          // live tail / picker / agents flow
+        Constraint::Length(1),       // status (footer, just above prompt)
         Constraint::Length(input_h), // prompt
     ])
     .split(area);
 
     let cursor_char = app.cursor_char();
-    draw_status(f, chunks[0], app);
-    draw_middle(f, chunks[1], app);
+    draw_middle(f, chunks[0], app);
+    draw_status(f, chunks[1], app);
     draw_prompt(f, chunks[2], app, &wrapped_input, cursor_char, prompt_inner_w);
 }
 
@@ -103,15 +107,12 @@ fn draw_middle(f: &mut Frame, area: Rect, app: &App) {
     }
     if app.picker.is_none() && app.completion.is_none() && app.running && !app.nodes.is_empty() {
         let spin = SPINNER[app.spinner % SPINNER.len()];
-        // Pre-wrap the focused stream (answer preferred, else thinking).
+        // Pre-wrap the focused stream (answer preferred, else thinking),
+        // preserving hard newlines so a banner line and the answer don't merge.
         let answering = !app.live_tail.is_empty();
         let body = if answering { &app.live_tail } else { &app.live_thinking };
         let avail = area.width.saturating_sub(4).max(8) as usize;
-        let tail: Vec<String> = if body.is_empty() { Vec::new() } else {
-            let w = wrap(body, avail);
-            let start = w.len().saturating_sub(2);
-            w[start..].to_vec()
-        };
+        let tail = tail_lines(body, avail, 2);
         let lines = render_agents_flow(
             &app.nodes,
             &app.live_actions,
@@ -141,7 +142,8 @@ fn draw_middle(f: &mut Frame, area: Rect, app: &App) {
             .collect();
         let title = format!("@{} · {} match{} · tab", picker.query, picker.matches.len(), if picker.matches.len() == 1 { "" } else { "es" });
         let block = Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::Cyan)).title(title);
-        f.render_widget(List::new(items).block(block), area);
+        let slot = bottom_slice(area, items.len() as u16 + 1);
+        f.render_widget(List::new(items).block(block), slot);
     } else if let Some(comp) = &app.completion {
         let rows = area.height as usize;
         let items: Vec<ListItem> = comp
@@ -178,7 +180,8 @@ fn draw_middle(f: &mut Frame, area: Rect, app: &App) {
             .borders(Borders::TOP)
             .border_style(Style::default().fg(Color::Cyan))
             .title(title);
-        f.render_widget(List::new(items).block(block), area);
+        let slot = bottom_slice(area, items.len() as u16 + 1);
+        f.render_widget(List::new(items).block(block), slot);
     } else if !app.live_tail.is_empty() || !app.live_thinking.is_empty() {
         // The in-progress streamed text, bottom-aligned. Show the answer once it
         // starts; until then show the reasoning (dimmed) so thinking is visible.
@@ -397,6 +400,34 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// A bottom-aligned sub-rect of `area` that is at most `want` rows tall. Used so
+/// the `@`-picker and slash-completion lists hug the prompt at the bottom of the
+/// (bottom-anchored) live region instead of floating at its top.
+fn bottom_slice(area: Rect, want: u16) -> Rect {
+    let h = want.min(area.height);
+    Rect { x: area.x, y: area.y + area.height - h, width: area.width, height: h }
+}
+
+/// The last `max` visual lines of `body` for the focused-stream tail. Splits on
+/// hard newlines first so logical lines (e.g. a `model:` banner and the answer
+/// that follows it) stay separate, then word-wraps each segment to `width`.
+/// Without the newline split, `wrap`'s `split_whitespace` would collapse the
+/// break and run the lines together.
+fn tail_lines(body: &str, width: usize, max: usize) -> Vec<String> {
+    if body.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for seg in body.split('\n') {
+        if seg.trim().is_empty() {
+            continue;
+        }
+        out.extend(wrap(seg, width));
+    }
+    let start = out.len().saturating_sub(max);
+    out[start..].to_vec()
+}
+
 /// Char-preserving wrap for the input field: splits on hard `\n` first, then
 /// width-wraps each logical line so spaces and cursor positions are preserved.
 fn wrap_input(text: &str, width: usize) -> Vec<String> {
@@ -593,6 +624,35 @@ mod tests {
         assert_eq!(wrap_input("a b ", 80), vec!["a b ".to_string()]);
         assert_eq!(wrap_input("", 80), vec![String::new()]);
         assert_eq!(wrap_input("abcdef", 3), vec!["abc".to_string(), "def".to_string()]);
+    }
+
+    #[test]
+    fn bottom_slice_hugs_bottom() {
+        let area = Rect { x: 2, y: 0, width: 40, height: 10 };
+        let s = bottom_slice(area, 3);
+        assert_eq!((s.x, s.y, s.width, s.height), (2, 7, 40, 3)); // last 3 rows
+        // Requesting more than available clamps to the area height.
+        let s2 = bottom_slice(area, 99);
+        assert_eq!((s2.y, s2.height), (0, 10));
+    }
+
+    #[test]
+    fn tail_lines_keeps_banner_and_answer_separate() {
+        // The `model:` banner and the answer arrive as separate lines in
+        // live_tail; the tail must not merge them onto one row.
+        let body = "model: sonnet-4-6\nI'll start by reviewing the recent commits.";
+        let lines = tail_lines(body, 80, 2);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "model: sonnet-4-6");
+        assert!(lines[1].starts_with("I'll start"), "{:?}", lines[1]);
+    }
+
+    #[test]
+    fn tail_lines_takes_last_max_and_handles_empty() {
+        assert!(tail_lines("", 80, 2).is_empty());
+        let body = "one\ntwo\nthree\nfour";
+        let lines = tail_lines(body, 80, 2);
+        assert_eq!(lines, vec!["three".to_string(), "four".to_string()]);
     }
 
     #[test]
