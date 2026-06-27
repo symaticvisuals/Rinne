@@ -96,37 +96,54 @@ pub fn intro_lines(cfg: &rinne_config::Config) -> Vec<Line<'static>> {
     )));
     out.push(Line::default());
 
-    // Harnesses row (configured / enabled).
-    let harnesses = &cfg.backends.harness.enabled;
-    let h_value = if harnesses.is_empty() {
-        "(none — /connect to add one)".to_string()
+    // Harnesses block: a header row, then one row per enabled harness showing
+    // its configured default model (from `[models]`) when known.
+    out.push(Line::from(Span::styled(
+        "  harnesses",
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    if cfg.backends.harness.enabled.is_empty() {
+        out.push(Line::from(Span::styled(
+            "             (none — /connect to add one)",
+            Style::default().fg(Color::Gray),
+        )));
     } else {
-        harnesses.join(" · ")
-    };
-    out.push(Line::from(vec![
-        Span::styled("  harnesses  ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(h_value, Style::default().fg(Color::Gray)),
-    ]));
-
-    // Models row: conductor model + each configured API provider's default.
-    let mut model_bits: Vec<String> = vec![format!("conductor: {}", cfg.conductor.model)];
-    let apis: Vec<String> = cfg
-        .backends
-        .api
-        .providers
-        .iter()
-        .map(|(name, p)| match &p.model {
-            Some(m) => format!("{name}: {m}"),
-            None => name.clone(),
-        })
-        .collect();
-    if !apis.is_empty() {
-        model_bits.push(format!("api: {}", apis.join(", ")));
+        for name in &cfg.backends.harness.enabled {
+            let mut spans = vec![
+                Span::raw("             "),
+                Span::styled(format!("{name:<14}"), Style::default().fg(Color::Cyan)),
+            ];
+            if let Some(model) = cfg.models.by_worker.get(name) {
+                spans.push(Span::styled(model.clone(), Style::default().fg(Color::Gray)));
+            } else {
+                spans.push(Span::styled("(default model)", Style::default().fg(Color::DarkGray)));
+            }
+            out.push(Line::from(spans));
+        }
     }
+    out.push(Line::default());
+
+    // Models block: a header row with the conductor model, then one row per
+    // configured API provider listing its full ladder (cheap→strong). The
+    // provider's `models` ladder is preferred; otherwise its single `model`.
     out.push(Line::from(vec![
         Span::styled("  models     ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-        Span::styled(model_bits.join("  ·  "), Style::default().fg(Color::Gray)),
+        Span::styled(format!("conductor: {}", cfg.conductor.model), Style::default().fg(Color::Gray)),
     ]));
+    for (name, p) in &cfg.backends.api.providers {
+        let ladder = if !p.models.is_empty() {
+            p.models.join(" · ")
+        } else if let Some(m) = &p.model {
+            m.clone()
+        } else {
+            "(no model configured)".to_string()
+        };
+        out.push(Line::from(vec![
+            Span::raw("             "),
+            Span::styled(format!("{name:<10} "), Style::default().fg(Color::Magenta)),
+            Span::styled(ladder, Style::default().fg(Color::Gray)),
+        ]));
+    }
     out.push(Line::default());
 
     out.push(Line::from(Span::styled(
@@ -698,7 +715,20 @@ mod tests {
 
     #[test]
     fn intro_lines_show_wordmark_and_dashboard() {
-        let cfg = rinne_config::Config::default();
+        let mut cfg = rinne_config::Config::default();
+        // A configured harness default model should show on its row.
+        cfg.models.by_worker.insert("claude-code".into(), "sonnet".into());
+        // A provider with a full ladder should list every model, one row.
+        cfg.backends.api.providers.insert(
+            "openai".to_string(),
+            rinne_config::model::ApiProvider {
+                key_env: "OPENAI_API_KEY".into(),
+                base_url: None,
+                model: Some("gpt-5-mini".into()),
+                models: vec!["gpt-5-mini".into(), "gpt-5".into(), "gpt-5-codex".into()],
+                extra_body: None,
+            },
+        );
         let lines = intro_lines(&cfg);
         let text: String = lines
             .iter()
@@ -709,8 +739,12 @@ mod tests {
         assert!(text.contains("conductor for your AI coding tools"), "tagline missing");
         assert!(text.contains("harnesses"), "harnesses row missing");
         assert!(text.contains("models"), "models row missing");
-        // Default config enables claude-code; it should be listed.
+        // Default config enables claude-code; it should be listed with its model.
         assert!(text.contains("claude-code"), "configured harness missing: {text}");
+        assert!(text.contains("sonnet"), "harness default model missing: {text}");
+        // The provider's full ladder is shown, not just the default.
+        assert!(text.contains("openai"), "provider missing: {text}");
+        assert!(text.contains("gpt-5") && text.contains("gpt-5-codex"), "model ladder missing: {text}");
         // The wordmark rows use the gradient: more than one fg color appears.
         let colors: std::collections::HashSet<_> = lines
             .iter()
