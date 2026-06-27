@@ -14,7 +14,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Widget};
 use ratatui::{Frame, Terminal};
 
-use super::{markdown, App, FeedKind};
+use rinne_core::NodeStatus;
+
+use super::{markdown, App, FeedKind, NodeView};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -431,10 +433,131 @@ fn cursor_pos_in_text(text: &str, width: usize, cursor_char: usize) -> (usize, u
     (line, col)
 }
 
+fn render_agents_flow(
+    nodes: &[NodeView],
+    actions: &std::collections::HashMap<String, Vec<String>>,
+    focused: Option<&str>,
+    spinner: &str,
+    tail: &[String],
+    height: usize,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if height == 0 { return out; }
+
+    // Order: active (running/parked) first, then finished — so truncation drops
+    // finished/overflow last.
+    let mut order: Vec<usize> = (0..nodes.len()).collect();
+    order.sort_by_key(|&i| match nodes[i].status {
+        NodeStatus::Running | NodeStatus::Parked => 0,
+        _ => 1,
+    });
+
+    // Reserve room for the focused tail (at most 2 lines) when present.
+    let tail_budget = if focused.is_some() && !tail.is_empty() { tail.len().min(2) } else { 0 };
+    let body_budget = height.saturating_sub(tail_budget);
+
+    let mut shown = 0usize;
+    for (rank, &i) in order.iter().enumerate() {
+        let n = &nodes[i];
+        let identity = agent_color(i);
+        let is_focused = focused == Some(n.id.as_str());
+        let (glyph, gcolor) = status_glyph(n.status, identity, spinner, is_focused);
+
+        // Heading line: "● Role  worker [· done]"
+        let role_color = match n.status {
+            NodeStatus::Running | NodeStatus::Parked => identity,
+            _ => Color::DarkGray,
+        };
+        let mut heading = vec![
+            Span::styled(format!("{glyph} "), Style::default().fg(gcolor)),
+            Span::styled(n.role.clone(), Style::default().fg(role_color).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(n.worker.clone(), Style::default().fg(Color::DarkGray)),
+        ];
+        if matches!(n.status, NodeStatus::Succeeded) {
+            heading.push(Span::styled("  · done", Style::default().fg(Color::DarkGray)));
+        } else if matches!(n.status, NodeStatus::Failed) {
+            heading.push(Span::styled("  · failed", Style::default().fg(Color::Red)));
+        }
+
+        // Will this heading (+ at least nothing) fit? If only room for a summary, emit it.
+        let remaining = body_budget.saturating_sub(shown);
+        let left = order.len() - rank;
+        if remaining <= 1 && left > 1 {
+            out.push(Line::from(Span::styled(
+                format!("  … +{} more agents", left),
+                Style::default().fg(Color::DarkGray),
+            )));
+            shown += 1;
+            break;
+        }
+        if shown >= body_budget { break; }
+        out.push(Line::from(heading));
+        shown += 1;
+
+        // Action lines for running/parked agents only, budget permitting.
+        if matches!(n.status, NodeStatus::Running | NodeStatus::Parked) {
+            if let Some(acts) = actions.get(&n.id) {
+                for a in acts.iter() {
+                    if shown >= body_budget { break; }
+                    out.push(Line::from(vec![
+                        Span::styled("  ⏺ ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(a.clone(), Style::default().fg(Color::DarkGray)),
+                    ]));
+                    shown += 1;
+                }
+            }
+        }
+    }
+
+    // Focused stream tail under a ┊ gutter.
+    if tail_budget > 0 {
+        for l in tail.iter().take(tail_budget) {
+            out.push(Line::from(vec![
+                Span::styled("  ┊ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(l.clone(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+            ]));
+        }
+    }
+    out
+}
+
+fn agent_color(index: usize) -> Color {
+    const PALETTE: [Color; 5] = [Color::Cyan, Color::Magenta, Color::Green, Color::Yellow, Color::Blue];
+    PALETTE[index % PALETTE.len()]
+}
+
+fn status_glyph(status: NodeStatus, identity: Color, spinner: &str, focused: bool) -> (String, Color) {
+    match status {
+        NodeStatus::Running if focused => (spinner.to_string(), Color::Cyan),
+        NodeStatus::Running => ("●".to_string(), identity),
+        NodeStatus::Parked => ("⏸".to_string(), Color::Yellow),
+        NodeStatus::Succeeded => ("✔".to_string(), Color::Green),
+        NodeStatus::Failed => ("✗".to_string(), Color::Red),
+        _ => ("○".to_string(), Color::DarkGray),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tui::{FeedEntry, FeedKind};
+
+    #[test]
+    fn agent_color_cycles_palette() {
+        assert_eq!(agent_color(0), Color::Cyan);
+        assert_eq!(agent_color(5), Color::Cyan); // wraps
+        assert_eq!(agent_color(1), Color::Magenta);
+    }
+
+    #[test]
+    fn status_glyph_per_state() {
+        let id = Color::Magenta;
+        assert_eq!(status_glyph(NodeStatus::Succeeded, id, "⠹", false), ("✔".into(), Color::Green));
+        assert_eq!(status_glyph(NodeStatus::Failed, id, "⠹", false), ("✗".into(), Color::Red));
+        assert_eq!(status_glyph(NodeStatus::Running, id, "⠹", false).0, "●".to_string());
+        assert_eq!(status_glyph(NodeStatus::Running, id, "⠹", true).0, "⠹".to_string());
+    }
 
     #[test]
     fn input_wrap_preserves_spaces() {
@@ -511,5 +634,45 @@ mod tests {
         // Width wrap and the trailing-empty-line case must agree with wrap_input.
         assert_eq!(cursor_pos_in_text("abcdef", 3, 3), (0, 3)); // at the wrap boundary
         assert_eq!(cursor_pos_in_text("a\n", 80, 2), (1, 0));   // cursor on the new empty line
+    }
+
+    #[test]
+    fn agents_flow_renders_role_headings_and_actions() {
+        use std::collections::HashMap;
+        let nodes = vec![
+            NodeView { id: "n1".into(), role: "generator".into(), status: NodeStatus::Running, worker: "claude-code".into() },
+            NodeView { id: "n2".into(), role: "scanner".into(), status: NodeStatus::Succeeded, worker: "haiku".into() },
+        ];
+        let mut actions = HashMap::new();
+        actions.insert("n1".to_string(), vec!["Read Cargo.toml".to_string(), "Searched needle".to_string()]);
+        let lines = render_agents_flow(&nodes, &actions, Some("n1"), "⠹", &[], 20);
+        let text: String = lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.as_ref().to_string()).collect();
+        assert!(text.contains("generator") && text.contains("claude-code"), "{text}");
+        assert!(text.contains("Read Cargo.toml") && text.contains("Searched needle"), "{text}");
+        assert!(text.contains("scanner"), "finished agent heading still shown: {text}");
+        // No node-ids leak into the user view.
+        assert!(!text.contains("n1") && !text.contains("n2"), "ids must not appear: {text}");
+    }
+
+    #[test]
+    fn agents_flow_truncates_under_height_pressure() {
+        use std::collections::HashMap;
+        let nodes: Vec<NodeView> = (0..10).map(|i| NodeView {
+            id: format!("n{i}"), role: format!("role{i}"), status: NodeStatus::Running, worker: "w".into(),
+        }).collect();
+        let lines = render_agents_flow(&nodes, &HashMap::new(), None, "⠹", &[], 4);
+        assert!(lines.len() <= 4, "must fit height: {}", lines.len());
+        let text: String = lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.as_ref().to_string()).collect();
+        assert!(text.contains("more agents"), "overflow summary expected: {text}");
+    }
+
+    #[test]
+    fn agents_flow_shows_focused_tail() {
+        use std::collections::HashMap;
+        let nodes = vec![NodeView { id: "n1".into(), role: "gen".into(), status: NodeStatus::Running, worker: "cc".into() }];
+        let tail = vec!["…scanning the workspace now".to_string()];
+        let lines = render_agents_flow(&nodes, &HashMap::new(), Some("n1"), "⠹", &tail, 20);
+        let text: String = lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.as_ref().to_string()).collect();
+        assert!(text.contains("┊") && text.contains("scanning the workspace"), "{text}");
     }
 }

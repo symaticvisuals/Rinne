@@ -46,6 +46,43 @@ const GLOB_LIMIT: usize = 400;
 /// Cap on persisted history entries kept in memory / loaded from disk.
 const HISTORY_MAX: usize = 1000;
 
+/// Recent actions kept per agent in the live view.
+const ACTIONS_PER_AGENT: usize = 4;
+
+/// Map a worker action event to a friendly, verb-first label (Claude-Code
+/// style). Returns `None` for non-action events. Adapter payloads already carry
+/// human text; this only normalises the leading verb and strips redundant
+/// adapter prefixes.
+fn action_label(ev: &rinne_core::worker::WorkerEvent) -> Option<String> {
+    use rinne_core::worker::WorkerEvent::*;
+    let strip = |s: &str, p: &str| s.strip_prefix(p).map(str::trim).map(str::to_string);
+    match ev {
+        Reading(m) => Some(format!("Read {}", m.trim())),
+        Editing(m) => {
+            if let Some(rest) = strip(m, "writing ") {
+                Some(format!("Wrote {rest}"))
+            } else if let Some(rest) = strip(m, "editing ") {
+                Some(format!("Edited {rest}"))
+            } else {
+                Some(format!("Edited {}", m.trim()))
+            }
+        }
+        ToolUse(m) => {
+            let m = m.trim();
+            if let Some(rest) = strip(m, "grep ") {
+                Some(format!("Searched {rest}"))
+            } else if let Some(rest) = strip(m, "glob ") {
+                Some(format!("Listed {rest}"))
+            } else if let Some(rest) = strip(m, "subagent: ") {
+                Some(format!("Delegated {rest}"))
+            } else {
+                Some(m.to_string())
+            }
+        }
+        Token(_) | Thinking(_) | Message(_) | Raw(_) | Done => None,
+    }
+}
+
 /// A node as shown in the (printed) plan listing and progress count.
 #[derive(Clone)]
 pub struct NodeView {
@@ -104,6 +141,9 @@ pub struct App {
     /// dimmed and committed just before the answer block.
     live_thinking: String,
     live_node: Option<String>,
+    /// Recent friendly actions per node (newest last), shown under the agent's
+    /// heading in the live view. Capped at `ACTIONS_PER_AGENT`.
+    live_actions: std::collections::HashMap<String, Vec<String>>,
     input: String,
     /// Cursor position in `input` as a byte index (always on a char boundary).
     cursor: usize,
@@ -139,6 +179,7 @@ impl App {
             live_tail: String::new(),
             live_thinking: String::new(),
             live_node: None,
+            live_actions: std::collections::HashMap::new(),
             input: String::new(),
             cursor: 0,
             history: Vec::new(),
@@ -251,6 +292,7 @@ impl App {
                 self.commit_tail();
                 self.goal = Some(goal);
                 self.nodes = nodes;
+                self.live_actions.clear();
                 self.running = true;
                 self.parked = None;
                 // Print the plan to scrollback as one block.
@@ -318,25 +360,20 @@ impl App {
             EngineEvent::NodeStream { id, event } => {
                 use rinne_core::worker::WorkerEvent::*;
                 let id = id.clone();
+                let action = action_label(&event);
                 match event {
                     Done => {}
-                    // Tool actions are discrete lines and break a text run.
-                    Reading(m) | Editing(m) | ToolUse(m) => {
+                    Reading(_) | Editing(_) | ToolUse(_) => {
                         self.commit_tail();
-                        let t = m.trim();
-                        if !t.is_empty() {
-                            self.push(FeedKind::Stream, format!("{id}  {t}"));
+                        if let Some(label) = action {
+                            let acts = self.live_actions.entry(id.clone()).or_default();
+                            acts.push(label);
+                            let n = acts.len();
+                            if n > ACTIONS_PER_AGENT { acts.drain(0..n - ACTIONS_PER_AGENT); }
                         }
                     }
-                    // A reasoning delta from a reasoning model — accumulate it as
-                    // a dimmed thinking block shown above the answer.
                     Thinking(t) => self.stream_thinking(&id, &t),
-                    // A raw streaming delta: concatenate verbatim (fragments are
-                    // mid-word). Any token-streaming worker — every API provider,
-                    // Grok — uses this, so rendering is correct regardless of name.
                     Token(t) => self.stream_token(&id, &t),
-                    // A discrete line/block (Claude blocks, Codex/OpenCode lines):
-                    // place it on its own line within the accumulating block.
                     Message(m) | Raw(m) => self.stream_line(&id, &m),
                 }
             }
@@ -345,6 +382,7 @@ impl App {
                 if let Some(n) = self.nodes.iter_mut().find(|n| n.id == id) {
                     n.status = status;
                 }
+                self.live_actions.remove(&id);
                 let kind = if status == NodeStatus::Succeeded { FeedKind::NodeOk } else { FeedKind::NodeFail };
                 self.push(kind, format!("{id} {}", status.label()));
             }
@@ -1586,5 +1624,49 @@ mod tests {
         assert_eq!(app.input, "line1\nline2");
         app.on_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn tool_calls_fill_live_actions_not_scrollback() {
+        use rinne_core::worker::WorkerEvent as W;
+        let mut app = app_for(&temp_dir("liveact"));
+        app.nodes = vec![NodeView { id: "n1".into(), role: "generator".into(), status: NodeStatus::Running, worker: "claude-code".into() }];
+        let before = app.pending.len();
+        app.apply_engine(EngineEvent::NodeStream { id: "n1".into(), event: W::Reading("Cargo.toml".into()) });
+        app.apply_engine(EngineEvent::NodeStream { id: "n1".into(), event: W::ToolUse("grep needle".into()) });
+        assert_eq!(app.live_actions.get("n1").map(Vec::as_slice), Some(["Read Cargo.toml".to_string(), "Searched needle".to_string()].as_slice()));
+        assert_eq!(app.pending.len(), before, "tool calls must not be pushed to scrollback");
+    }
+
+    #[test]
+    fn live_actions_capped_per_agent() {
+        use rinne_core::worker::WorkerEvent as W;
+        let mut app = app_for(&temp_dir("liveactcap"));
+        app.nodes = vec![NodeView { id: "n1".into(), role: "r".into(), status: NodeStatus::Running, worker: "w".into() }];
+        for i in 0..(ACTIONS_PER_AGENT + 3) {
+            app.apply_engine(EngineEvent::NodeStream { id: "n1".into(), event: W::Reading(format!("f{i}.rs")) });
+        }
+        let acts = app.live_actions.get("n1").unwrap();
+        assert_eq!(acts.len(), ACTIONS_PER_AGENT);
+        assert_eq!(acts.last().unwrap(), &format!("Read f{}.rs", ACTIONS_PER_AGENT + 2));
+    }
+
+    #[test]
+    fn action_label_maps_friendly_verbs() {
+        use rinne_core::worker::WorkerEvent as W;
+        let cases = [
+            (W::Reading("Cargo.toml".into()), Some("Read Cargo.toml")),
+            (W::Editing("editing src/foo.rs".into()), Some("Edited src/foo.rs")),
+            (W::Editing("writing src/foo.rs".into()), Some("Wrote src/foo.rs")),
+            (W::ToolUse("grep needle".into()), Some("Searched needle")),
+            (W::ToolUse("glob **/*.rs".into()), Some("Listed **/*.rs")),
+            (W::ToolUse("subagent: review the diff".into()), Some("Delegated review the diff")),
+            (W::ToolUse("cargo build".into()), Some("cargo build")),
+            (W::Token("hi".into()), None),
+            (W::Done, None),
+        ];
+        for (ev, want) in cases {
+            assert_eq!(super::action_label(&ev).as_deref(), want, "for {ev:?}");
+        }
     }
 }
