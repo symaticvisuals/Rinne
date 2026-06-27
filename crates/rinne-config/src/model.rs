@@ -18,6 +18,23 @@ pub struct Config {
     /// Per-harness default model, e.g. `claude-code = "sonnet"`. Switchable
     /// between sessions by editing config (`CONTEXT.md` §7).
     pub models: ModelDefaults,
+    pub update: UpdateConfig,
+}
+
+/// `[update]` — automatic new-release notification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Whether to check GitHub Releases for a newer version on startup. The
+    /// check is cached for a day, runs in the background, and never blocks a
+    /// command. Set to `false`, or export `RINNE_NO_UPDATE_CHECK=1`, to disable.
+    pub check: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self { check: true }
+    }
 }
 
 /// `[models]` — default model per worker name.

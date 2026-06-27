@@ -8,6 +8,7 @@ mod commands;
 mod runner;
 mod telemetry;
 mod tui;
+mod update;
 
 use std::path::PathBuf;
 
@@ -27,6 +28,14 @@ async fn main() -> Result<()> {
     // A `-p` prompt means one-shot headless mode regardless of subcommand.
     if let Some(task) = args.prompt.as_deref() {
         return run_oneshot(task, args.json).await;
+    }
+
+    // Best-effort new-release banner; never blocks or fails a command. Skipped
+    // in `--json` mode and (inside `notify`) when stderr is not a terminal.
+    if !args.json {
+        if let Ok(config) = rinne_config::load_cwd() {
+            update::notify(&config).await;
+        }
     }
 
     match args.command {
