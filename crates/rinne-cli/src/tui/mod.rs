@@ -889,7 +889,8 @@ impl App {
             }
             "models" => {
                 if rest.is_empty() {
-                    self.push(FeedKind::System, "usage: /models <provider>  (lists the models an API provider's key can access)");
+                    // No provider: show all available workers + ladders (like the intro).
+                    self.list_models_all();
                 } else {
                     self.list_models_for(rest.split_whitespace().next().unwrap_or("").to_string());
                 }
@@ -965,6 +966,30 @@ impl App {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let text = crate::commands::models::list_lines(&provider).await.join("\n");
+            let _ = tx.send(AppMsg::Note(text));
+        });
+    }
+
+    /// No-arg `/models`: re-show the live workers table (re-armed and resolved by
+    /// a fresh probe) AND print a durable text overview to scrollback.
+    fn list_models_all(&mut self) {
+        if let Ok(config) = rinne_config::load_cwd() {
+            // Re-arm the live intro table (re-runs the checking→resolved animation).
+            if !self.running {
+                self.set_intro(&config);
+            }
+            let probe_tx = self.tx.clone();
+            tokio::spawn(async move {
+                if let Ok((registry, names)) = runner::build_registry(&config).await {
+                    let ladders = rinne_core::pool::profile(&registry.descriptors()).ladders();
+                    let _ = probe_tx.send(AppMsg::Capabilities { available: names, ladders });
+                }
+            });
+        }
+        // Durable text record of the same data.
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let text = crate::commands::models::overview_lines().await.join("\n");
             let _ = tx.send(AppMsg::Note(text));
         });
     }
@@ -1182,7 +1207,7 @@ fn help_text() -> String {
         ("/workers", "list workers + connected APIs and their auth"),
         ("/connect <b>", "connect a harness, or an API provider + key (e.g. /connect deepseek sk-…)"),
         ("/forget <p>", "delete a stored API key from the OS keychain"),
-        ("/models <p>", "list the models an API provider's key can access"),
+        ("/models [p]", "all workers + ladders, or a provider's full catalog"),
         ("/config", "show/edit config: conductor <b> [--key <t>], set <k> <v>, init, edit"),
         ("/steer <text>", "give guidance to a parked node (or just type while parked)"),
         ("/approve", "accept the current state and continue"),
