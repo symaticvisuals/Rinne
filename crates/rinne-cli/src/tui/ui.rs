@@ -96,32 +96,18 @@ pub fn intro_lines(cfg: &rinne_config::Config) -> Vec<Line<'static>> {
     )));
     out.push(Line::default());
 
-    // Harnesses block: a header row, then one row per enabled harness showing
-    // its configured default model (from `[models]`) when known.
-    out.push(Line::from(Span::styled(
-        "  harnesses",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )));
-    if cfg.backends.harness.enabled.is_empty() {
-        out.push(Line::from(Span::styled(
-            "             (none — /connect to add one)",
-            Style::default().fg(Color::Gray),
-        )));
+    // Harnesses row (configured / enabled). Each harness's full model ladder is
+    // resolved asynchronously and appended by the background capabilities block,
+    // so the instant intro lists names only.
+    let h_value = if cfg.backends.harness.enabled.is_empty() {
+        "(none — /connect to add one)".to_string()
     } else {
-        for name in &cfg.backends.harness.enabled {
-            let mut spans = vec![
-                Span::raw("             "),
-                Span::styled(format!("{name:<14}"), Style::default().fg(Color::Cyan)),
-            ];
-            if let Some(model) = cfg.models.by_worker.get(name) {
-                spans.push(Span::styled(model.clone(), Style::default().fg(Color::Gray)));
-            } else {
-                spans.push(Span::styled("(default model)", Style::default().fg(Color::DarkGray)));
-            }
-            out.push(Line::from(spans));
-        }
-    }
-    out.push(Line::default());
+        cfg.backends.harness.enabled.join(" · ")
+    };
+    out.push(Line::from(vec![
+        Span::styled("  harnesses  ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(h_value, Style::default().fg(Color::Gray)),
+    ]));
 
     // Models block: a header row with the conductor model, then one row per
     // configured API provider listing its full ladder (cheap→strong). The
@@ -716,8 +702,6 @@ mod tests {
     #[test]
     fn intro_lines_show_wordmark_and_dashboard() {
         let mut cfg = rinne_config::Config::default();
-        // A configured harness default model should show on its row.
-        cfg.models.by_worker.insert("claude-code".into(), "sonnet".into());
         // A provider with a full ladder should list every model, one row.
         cfg.backends.api.providers.insert(
             "openai".to_string(),
@@ -739,9 +723,8 @@ mod tests {
         assert!(text.contains("conductor for your AI coding tools"), "tagline missing");
         assert!(text.contains("harnesses"), "harnesses row missing");
         assert!(text.contains("models"), "models row missing");
-        // Default config enables claude-code; it should be listed with its model.
+        // Default config enables claude-code; it should be listed.
         assert!(text.contains("claude-code"), "configured harness missing: {text}");
-        assert!(text.contains("sonnet"), "harness default model missing: {text}");
         // The provider's full ladder is shown, not just the default.
         assert!(text.contains("openai"), "provider missing: {text}");
         assert!(text.contains("gpt-5") && text.contains("gpt-5-codex"), "model ladder missing: {text}");

@@ -83,15 +83,25 @@ fn viewport_height_for(rows: u16) -> u16 {
     preferred.min(rows.saturating_sub(1)).max(1)
 }
 
-/// One-line availability summary appended after the intro once the background
-/// probe finishes: which configured workers are actually usable right now.
-fn availability_note(report: &rinne_config::DoctorReport) -> String {
-    let available: Vec<&str> = report.available().map(|w| w.name.as_str()).collect();
-    if available.is_empty() {
-        "no workers available yet — run `rinne doctor` or /connect to set one up".to_string()
-    } else {
-        format!("✔ available: {}", available.join(" · "))
+/// A capabilities block appended after the intro once the background registry
+/// build finishes: which workers are actually usable now, and for each worker
+/// that exposes more than one model, its full cascade ladder (cheap→strong).
+/// `names` are the registered (available) worker names; `ladders` maps a worker
+/// name to its model ladder.
+fn capabilities_block(names: &[String], ladders: &std::collections::HashMap<String, Vec<String>>) -> String {
+    if names.is_empty() {
+        return "no workers available yet — run `rinne doctor` or /connect to set one up".to_string();
     }
+    let mut s = format!("✔ available: {}", names.join(" · "));
+    // One line per worker that has a real ladder, sorted for stable output.
+    let mut keyed: Vec<(&String, &Vec<String>)> = ladders.iter().collect();
+    keyed.sort_by(|a, b| a.0.cmp(b.0));
+    for (worker, ladder) in keyed {
+        if ladder.len() > 1 {
+            s.push_str(&format!("\n  {worker}: {}", ladder.join(" · ")));
+        }
+    }
+    s
 }
 
 /// Map a worker action event to a friendly, verb-first label (Claude-Code
@@ -1262,14 +1272,16 @@ pub async fn run() -> Result<()> {
     }
 
     // Render the styled intro banner into scrollback once, from the loaded
-    // config (instant, synchronous). Then kick off a background probe that
-    // reports which configured workers are actually available.
+    // config (instant, synchronous). Then kick off a background task that builds
+    // the worker registry (async) and reports which workers are actually
+    // available plus each available harness's full model ladder.
     if let Ok(config) = rinne_config::load_cwd() {
         let _ = ui::flush_lines(&mut terminal, ui::intro_lines(&config));
         let probe_tx = tx_for_probe.clone();
         tokio::spawn(async move {
-            if let Ok(report) = rinne_config::doctor(&config, false).await {
-                let _ = probe_tx.send(AppMsg::Note(availability_note(&report)));
+            if let Ok((registry, names)) = runner::build_registry(&config).await {
+                let ladders = rinne_core::pool::profile(&registry.descriptors()).ladders();
+                let _ = probe_tx.send(AppMsg::Note(capabilities_block(&names, &ladders)));
             }
         });
     }
@@ -1742,32 +1754,21 @@ mod tests {
     }
 
     #[test]
-    fn availability_note_summarizes_or_prompts() {
-        use rinne_config::probe::{AuthMode, WorkerFamily, WorkerProbe, WorkerStatus};
-        use rinne_config::DoctorReport;
-        let mk = |name: &str, status: WorkerStatus| WorkerProbe {
-            name: name.into(),
-            family: WorkerFamily::Harness,
-            status,
-            auth_mode: AuthMode::Subscription,
-            enabled: true,
-            warnings: vec![],
-        };
-        let some = DoctorReport {
-            workers: vec![
-                mk("claude-code", WorkerStatus::Available),
-                mk("grok", WorkerStatus::NotInstalled),
-                mk("codex", WorkerStatus::Available),
-            ],
-            warnings: vec![],
-            recommendations: vec![],
-        };
-        let note = super::availability_note(&some);
-        assert!(note.contains("claude-code") && note.contains("codex"), "{note}");
-        assert!(!note.contains("grok"), "not-installed must be excluded: {note}");
+    fn capabilities_block_lists_available_and_ladders() {
+        use std::collections::HashMap;
+        let names = vec!["claude-code".to_string(), "codex".to_string()];
+        let mut ladders: HashMap<String, Vec<String>> = HashMap::new();
+        ladders.insert("claude-code".into(), vec!["haiku".into(), "sonnet".into(), "opus".into()]);
+        ladders.insert("codex".into(), vec!["gpt-5-codex".into()]); // single → no ladder row
+        let block = super::capabilities_block(&names, &ladders);
+        assert!(block.contains("✔ available: claude-code · codex"), "{block}");
+        // Multi-model harness shows its full ladder on its own line.
+        assert!(block.contains("claude-code: haiku · sonnet · opus"), "{block}");
+        // Single-model worker does NOT get a ladder line.
+        assert!(!block.contains("codex: gpt-5-codex"), "{block}");
 
-        let none = DoctorReport { workers: vec![mk("grok", WorkerStatus::NotInstalled)], warnings: vec![], recommendations: vec![] };
-        assert!(super::availability_note(&none).contains("no workers available"), "{}", super::availability_note(&none));
+        let empty = super::capabilities_block(&[], &HashMap::new());
+        assert!(empty.contains("no workers available"), "{empty}");
     }
 
     #[test]
