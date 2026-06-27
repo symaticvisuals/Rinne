@@ -45,6 +45,102 @@ pub fn flush_pending(
     Ok(())
 }
 
+/// Emit pre-styled lines straight into scrollback (above the inline viewport).
+/// Used for the one-time intro banner, whose per-letter gradient can't be
+/// expressed through the text-based feed pipeline.
+pub fn flush_lines(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    lines: Vec<Line<'static>>,
+) -> io::Result<()> {
+    for line in lines {
+        terminal.insert_before(1, move |buf| {
+            Paragraph::new(line).render(buf.area, buf);
+        })?;
+    }
+    Ok(())
+}
+
+/// The five identity colors, reused for the wordmark gradient.
+const GRADIENT: [Color; 5] = [Color::Cyan, Color::Magenta, Color::Blue, Color::Green, Color::Cyan];
+
+/// The startup intro: a gradient `rinne` wordmark, a tagline, and a live
+/// capability dashboard (configured harnesses + conductor/API models) built from
+/// the loaded config. Honest about state: it lists what's *configured*; a
+/// background probe later appends which are actually available.
+pub fn intro_lines(cfg: &rinne_config::Config) -> Vec<Line<'static>> {
+    // Block-glyph wordmark; each row colored left→right with the gradient so the
+    // letters fade across the palette.
+    let art = [
+        "  ╦═╗ ╦ ╔╗╔ ╔╗╔ ╔═╗",
+        "  ╠╦╝ ║ ║║║ ║║║ ╠╣ ",
+        "  ╩╚═ ╩ ╝╚╝ ╝╚╝ ╚═╝",
+    ];
+    let mut out: Vec<Line<'static>> = Vec::new();
+    out.push(Line::default());
+    for row in art {
+        let chars: Vec<char> = row.chars().collect();
+        let n = chars.len().max(1);
+        let spans: Vec<Span<'static>> = chars
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let color = GRADIENT[(i * GRADIENT.len() / n).min(GRADIENT.len() - 1)];
+                Span::styled(c.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD))
+            })
+            .collect();
+        out.push(Line::from(spans));
+    }
+    out.push(Line::from(Span::styled(
+        "  the conductor for your AI coding tools",
+        Style::default().fg(Color::DarkGray),
+    )));
+    out.push(Line::default());
+
+    // Harnesses row (configured / enabled).
+    let harnesses = &cfg.backends.harness.enabled;
+    let h_value = if harnesses.is_empty() {
+        "(none — /connect to add one)".to_string()
+    } else {
+        harnesses.join(" · ")
+    };
+    out.push(Line::from(vec![
+        Span::styled("  harnesses  ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(h_value, Style::default().fg(Color::Gray)),
+    ]));
+
+    // Models row: conductor model + each configured API provider's default.
+    let mut model_bits: Vec<String> = vec![format!("conductor: {}", cfg.conductor.model)];
+    let apis: Vec<String> = cfg
+        .backends
+        .api
+        .providers
+        .iter()
+        .map(|(name, p)| match &p.model {
+            Some(m) => format!("{name}: {m}"),
+            None => name.clone(),
+        })
+        .collect();
+    if !apis.is_empty() {
+        model_bits.push(format!("api: {}", apis.join(", ")));
+    }
+    out.push(Line::from(vec![
+        Span::styled("  models     ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(model_bits.join("  ·  "), Style::default().fg(Color::Gray)),
+    ]));
+    out.push(Line::default());
+
+    out.push(Line::from(Span::styled(
+        "  › describe what you want done, then press enter",
+        Style::default().fg(Color::White),
+    )));
+    out.push(Line::from(Span::styled(
+        "  @ files · /help · /clear · shift-enter newline · ctrl-q quit",
+        Style::default().fg(Color::DarkGray),
+    )));
+    out.push(Line::default());
+    out
+}
+
 /// Draw the inline live region: status, in-progress text or picker, and prompt.
 pub fn draw_viewport(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -599,6 +695,30 @@ fn status_glyph(status: NodeStatus, identity: Color, spinner: &str, focused: boo
 mod tests {
     use super::*;
     use crate::tui::{FeedEntry, FeedKind};
+
+    #[test]
+    fn intro_lines_show_wordmark_and_dashboard() {
+        let cfg = rinne_config::Config::default();
+        let lines = intro_lines(&cfg);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("conductor for your AI coding tools"), "tagline missing");
+        assert!(text.contains("harnesses"), "harnesses row missing");
+        assert!(text.contains("models"), "models row missing");
+        // Default config enables claude-code; it should be listed.
+        assert!(text.contains("claude-code"), "configured harness missing: {text}");
+        // The wordmark rows use the gradient: more than one fg color appears.
+        let colors: std::collections::HashSet<_> = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter_map(|s| s.style.fg)
+            .collect();
+        assert!(colors.len() >= 3, "expected a multi-color gradient, got {colors:?}");
+    }
 
     #[test]
     fn agent_color_cycles_palette() {

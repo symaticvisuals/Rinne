@@ -83,6 +83,17 @@ fn viewport_height_for(rows: u16) -> u16 {
     preferred.min(rows.saturating_sub(1)).max(1)
 }
 
+/// One-line availability summary appended after the intro once the background
+/// probe finishes: which configured workers are actually usable right now.
+fn availability_note(report: &rinne_config::DoctorReport) -> String {
+    let available: Vec<&str> = report.available().map(|w| w.name.as_str()).collect();
+    if available.is_empty() {
+        "no workers available yet — run `rinne doctor` or /connect to set one up".to_string()
+    } else {
+        format!("✔ available: {}", available.join(" · "))
+    }
+}
+
 /// Map a worker action event to a friendly, verb-first label (Claude-Code
 /// style). Returns `None` for non-action events. Adapter payloads already carry
 /// human text; this only normalises the leading verb and strips redundant
@@ -205,7 +216,7 @@ pub struct App {
 
 impl App {
     fn new(index: FileIndex, tx: tokio::sync::mpsc::UnboundedSender<AppMsg>) -> Self {
-        let mut app = Self {
+        Self {
             goal: None,
             nodes: Vec::new(),
             pending: Vec::new(),
@@ -230,10 +241,10 @@ impl App {
             should_quit: false,
             cancel: None,
             tx,
-        };
-        app.push(FeedKind::System, "Welcome to Rinne. Describe what you want done and press Enter.");
-        app.push(FeedKind::System, "Type @ to reference files · /help for commands · ctrl-q to quit · scroll the terminal to see history.");
-        app
+        }
+        // The styled intro banner is rendered once in `run()` before the event
+        // loop (it needs per-letter gradient styling that the text feed can't
+        // carry); see `ui::intro_lines`.
     }
 
     /// Queue a committed line for scrollback.
@@ -1215,6 +1226,9 @@ pub async fn run() -> Result<()> {
         }
     });
 
+    // Clone the sender for the background availability probe before `App` takes
+    // ownership of the original.
+    let tx_for_probe = tx.clone();
     let mut app = App::new(index, tx);
     // Persist prompt history across sessions under the project blackboard.
     app.attach_history(cwd.join(rinne_core::BLACKBOARD_DIR).join("history"));
@@ -1245,6 +1259,19 @@ pub async fn run() -> Result<()> {
     let kbd_enhanced = matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true));
     if kbd_enhanced {
         let _ = execute!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+    }
+
+    // Render the styled intro banner into scrollback once, from the loaded
+    // config (instant, synchronous). Then kick off a background probe that
+    // reports which configured workers are actually available.
+    if let Ok(config) = rinne_config::load_cwd() {
+        let _ = ui::flush_lines(&mut terminal, ui::intro_lines(&config));
+        let probe_tx = tx_for_probe.clone();
+        tokio::spawn(async move {
+            if let Ok(report) = rinne_config::doctor(&config, false).await {
+                let _ = probe_tx.send(AppMsg::Note(availability_note(&report)));
+            }
+        });
     }
 
     let result = event_loop(&mut terminal, &mut app, &mut rx).await;
@@ -1712,6 +1739,35 @@ mod tests {
         for (ev, want) in cases {
             assert_eq!(super::action_label(&ev).as_deref(), want, "for {ev:?}");
         }
+    }
+
+    #[test]
+    fn availability_note_summarizes_or_prompts() {
+        use rinne_config::probe::{AuthMode, WorkerFamily, WorkerProbe, WorkerStatus};
+        use rinne_config::DoctorReport;
+        let mk = |name: &str, status: WorkerStatus| WorkerProbe {
+            name: name.into(),
+            family: WorkerFamily::Harness,
+            status,
+            auth_mode: AuthMode::Subscription,
+            enabled: true,
+            warnings: vec![],
+        };
+        let some = DoctorReport {
+            workers: vec![
+                mk("claude-code", WorkerStatus::Available),
+                mk("grok", WorkerStatus::NotInstalled),
+                mk("codex", WorkerStatus::Available),
+            ],
+            warnings: vec![],
+            recommendations: vec![],
+        };
+        let note = super::availability_note(&some);
+        assert!(note.contains("claude-code") && note.contains("codex"), "{note}");
+        assert!(!note.contains("grok"), "not-installed must be excluded: {note}");
+
+        let none = DoctorReport { workers: vec![mk("grok", WorkerStatus::NotInstalled)], warnings: vec![], recommendations: vec![] };
+        assert!(super::availability_note(&none).contains("no workers available"), "{}", super::availability_note(&none));
     }
 
     #[test]
