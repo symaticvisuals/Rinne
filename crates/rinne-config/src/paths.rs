@@ -31,3 +31,9 @@ pub fn probe_cache_file() -> Option<PathBuf> {
     ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
         .map(|dirs| dirs.cache_dir().join("doctor-probe.json"))
 }
+
+/// The cached latest-release check path, under the global cache dir.
+pub fn update_cache_file() -> Option<PathBuf> {
+    ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
+        .map(|dirs| dirs.cache_dir().join("update-check.json"))
+}
